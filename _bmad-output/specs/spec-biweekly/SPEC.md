@@ -3,8 +3,10 @@ id: SPEC-biweekly
 companions:
   - validation.md
   - ../../../requirements/COMPETITION.md
+  - ../../planning-artifacts/architecture/architecture-Biweekly-2026-11-22/ARCHITECTURE-SPINE.md
 sources:
   - ../../planning-artifacts/briefs/brief-Biweekly-2026-11-22/brief.md
+  - ../../forge/cycle-1-signal-search/forged-idea.md
 ---
 
 # Biweekly Season 2 Competition Entry
@@ -21,11 +23,11 @@ Enter AlphaNova’s Season 2 Cycle 1 with a reproducible signal that can add dis
 
 - **CAP-2**
   - **intent:** Decide whether a candidate clears the local performance bar.
-  - **success:** A full walk-forward comparison over matching periods and settings shows positive candidate net Sharpe and strictly higher net Sharpe than the shipped `demo_engineered.py`. The run record supports reproducing the result.
+  - **success:** A complete full walk-forward compares the candidate, matched control, and shipped `demo_engineered.py` under matching settings. Candidate net Sharpe is positive and strictly above the shipped baseline. Record the difference between the candidate and matched control as experiment evidence.
 
 - **CAP-3**
   - **intent:** Determine whether a candidate clears the local novelty requirement.
-  - **success:** The candidate clears the requirement only with a measured nearest-city distance of at least 60° against the current Season 2 map. Hold it if the distance is below 60° or the comparison is unavailable.
+  - **success:** A complete comparison against the official Season 2 map current at decision time produces a finite, unrounded nearest-city distance of at least 60°. Hold the candidate if the distance is below 60° or the comparison is unavailable.
 
 - **CAP-4**
   - **intent:** Track the official outcome of the selected Cycle 1 entry.
@@ -37,6 +39,7 @@ Enter AlphaNova’s Season 2 Cycle 1 with a reproducible signal that can add dis
 - Forecast causally from the supplied features. Treat ticker identities as period-specific and keep cities outside the submitted model.
 - Keep training within 240 seconds and prediction within 60 seconds per call on CPU, with peak memory below 8 GB. Keep repeated retraining feasible under the official gate.
 - Meet the organizer’s submission structure, row-position, flat-period, and overfitting rules. See `validation.md` for the local evidence and its coverage.
+- Test weighted feature agreement first and use the full walk-forward for every experiment comparison. Follow the architecture spine for the matched experiment and the offline submission decision.
 
 ## Non-goals
 
