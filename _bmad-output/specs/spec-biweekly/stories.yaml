@@ -1,0 +1,30 @@
+- id: '1'
+  title: Build the weighted-vote predictor and matched control
+  description: Implement the CAP-1 weighted-vote Predictor and matched control as self-contained files from
+    one maintained pipeline. Verify that the files differ only at the vote selector, load in the shipped kit,
+    and return causal, repeatable, finite, aligned zero-sum positions.
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: '2'
+  title: Collect comparable walk-forward evidence
+  description: For CAP-2, use the offline command to check candidate preflight, model behavior, and resource
+    use, and run the shipped full walk-forward for the candidate, matched control, and baseline under matching
+    settings. Record coverage against expected periods and counts, unrounded net Sharpe, the control delta,
+    measured resource use, and digest-linked evidence for each completed or failed attempt.
+  spec_checkpoint: false
+  done_checkpoint: true
+- id: '3'
+  title: Apply the submit-or-hold decision
+  description: For CAP-3, check complete gauge coverage and measure novelty against the official Season 2
+    map current at decision time in the same offline command. Report ready only when the exact candidate has
+    complete passing evidence, finite positive net Sharpe strictly above the shipped baseline, and a finite
+    unrounded nearest-city distance of at least 60°, otherwise report hold with the cause.
+  spec_checkpoint: true
+  done_checkpoint: true
+- id: '4'
+  title: Record the manual submission and official outcome
+  description: For CAP-4, retain the exact candidate reported ready for manual submission and link the Cycle
+    1 outcome record to its file digest. Record AlphaNova’s entry verdict and any available settled Sharpe
+    and quality-set membership.
+  spec_checkpoint: false
+  done_checkpoint: false

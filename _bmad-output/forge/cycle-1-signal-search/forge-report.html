@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cycle 1 Signal Search | Forge Report</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17253a;
+        --muted: #4f5b68;
+        --paper: #fbf9f4;
+        --line: #dcd8cb;
+        --stamp: #942e31;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #eeeae0;
+        color: var(--ink);
+        font:
+          1rem/1.6 system-ui,
+          sans-serif;
+      }
+      main {
+        width: min(64rem, calc(100% - 2rem));
+        margin: clamp(1rem, 4vw, 3.5rem) auto;
+        padding: clamp(1.15rem, 5vw, 3.75rem);
+        border: 1px solid var(--line);
+        background: var(--paper);
+      }
+      header {
+        display: grid;
+        grid-template-columns: 1fr minmax(7.5rem, 11rem);
+        gap: 1.5rem;
+        align-items: center;
+        border-bottom: 2px solid var(--ink);
+        padding-bottom: 1.5rem;
+      }
+      h1,
+      h2 {
+        font-family: Georgia, serif;
+        line-height: 1.15;
+      }
+      h1 {
+        font-size: clamp(2.1rem, 6vw, 3.65rem);
+        margin: 0 0 0.6rem;
+      }
+      h2 {
+        font-size: 1.45rem;
+        margin: 0 0 0.55rem;
+      }
+      p,
+      ul {
+        margin: 0;
+      }
+      ul {
+        padding-left: 1.25rem;
+      }
+      li + li {
+        margin-top: 0.45rem;
+      }
+      section {
+        padding: 1.35rem 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .stamp {
+        width: 100%;
+        color: var(--stamp);
+        transform: rotate(-8deg);
+      }
+      .columns {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.75rem;
+      }
+      footer {
+        padding-top: 1rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      a {
+        color: inherit;
+        text-underline-offset: 0.16em;
+      }
+      @media (max-width: 40rem) {
+        header {
+          grid-template-columns: 1fr;
+        }
+        .stamp {
+          width: 9rem;
+          margin: 0.5rem 0;
+        }
+        .columns {
+          grid-template-columns: 1fr;
+          gap: 0;
+        }
+      }
+      @media print {
+        body,
+        main {
+          background: #fff;
+        }
+        main {
+          width: 100%;
+          margin: 0;
+          border: 0;
+          padding: 0;
+        }
+        section {
+          break-inside: avoid;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Cycle 1 signal search</h1>
+          <p>
+            Test whether explicit feature agreement improves the contestant’s
+            predictions and produces a signal that clears both local submission
+            requirements.
+          </p>
+        </div>
+        <svg
+          class="stamp"
+          viewBox="0 0 184 96"
+          role="img"
+          aria-label="Hardened"
+        >
+          <rect
+            x="6"
+            y="8"
+            width="172"
+            height="80"
+            rx="9"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+          />
+          <rect
+            x="12"
+            y="14"
+            width="160"
+            height="68"
+            rx="6"
+            fill="none"
+            stroke="currentColor"
+          />
+          <path
+            d="M31 29h122M31 67h122"
+            stroke="currentColor"
+            stroke-width="2"
+          />
+          <text
+            x="92"
+            y="55"
+            fill="currentColor"
+            text-anchor="middle"
+            font-family="system-ui, sans-serif"
+            font-size="19"
+            font-weight="800"
+            letter-spacing="2"
+          >
+            HARDENED
+          </text>
+        </svg>
+      </header>
+      <section aria-labelledby="decisions">
+        <h2 id="decisions">Locked decisions</h2>
+        <ul>
+          <li>Use the full walk-forward throughout the search.</li>
+          <li>
+            Test feature agreement across assets first. Keep the matched control
+            and candidate identical apart from the agreement feature, including
+            their position smoothing.
+          </li>
+          <li>
+            Submit only with positive full walk-forward net Sharpe above the
+            shipped baseline and an unrounded nearest-city distance of at least
+            60° on the current Season 2 map. Hold if the novelty comparison is
+            unavailable or falls below 60°.
+          </li>
+        </ul>
+      </section>
+      <section aria-labelledby="experiment">
+        <h2 id="experiment">First experiment</h2>
+        <p>
+          For each hour, rank each supplied feature across the 20 assets. Learn
+          from each training split whether higher or lower ranks tend to align
+          with the target. For each asset, weight each directional vote by its
+          rank distance from the median, then average the signed votes. Compare
+          the candidate with a control using the same rank inputs, learner
+          settings, and position smoothing. Report both full walk-forward scores
+          alongside the shipped baseline.
+        </p>
+      </section>
+      <div class="columns">
+        <section aria-labelledby="alternatives">
+          <h2 id="alternatives">Alternatives considered</h2>
+          <ul>
+            <li>
+              The proposed one-time holdout was set aside in favor of using the
+              full walk-forward for every comparison.
+            </li>
+            <li>
+              Recent rank changes and turnover-only changes were deferred so the
+              first comparison can isolate agreement.
+            </li>
+          </ul>
+        </section>
+        <section aria-labelledby="risks">
+          <h2 id="risks">Risks to check</h2>
+          <ul>
+            <li>
+              Repeated use of the same periods can favor lucky trials. Keep a
+              record of every result.
+            </li>
+            <li>
+              Correlated features can cast redundant votes. The matched control
+              tests whether explicit agreement contributes beyond the ranks
+              themselves.
+            </li>
+            <li>
+              The organizer checks time-averaged correlation for quality-set
+              admission. The city measurement supports the local submission
+              decision.
+            </li>
+          </ul>
+        </section>
+      </div>
+      <footer>
+        <p>
+          <strong>Perspectives</strong> 📊 Mary, evidence and selection bias. 💻
+          Amelia, isolating changes. 📏 Level, evidence of incremental value. 📈
+          Irina, quantitative validation and anonymized features.
+        </p>
+        <p>
+          <a href="../../specs/spec-biweekly/SPEC.md">Entry specification</a> ·
+          <a href="../../../requirements/demo_engineered.py"
+            >Shipped baseline</a
+          >
+          · <a href="../../../requirements/COMPETITION.md">Season 2 rules</a>
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>
