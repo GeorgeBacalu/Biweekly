@@ -21,13 +21,13 @@ The target’s construction is undisclosed, ticker identities rotate across peri
 
 - Fit on the Season 2 package and use causal features that generalize across assets and periods. Submit one Python file implementing the provided `Predictor` interface. Keep the shipped kit intact. [Competition data](../../../../requirements/COMPETITION.md#competition-data) · [Submission format](../../../../requirements/COMPETITION.md#submission-format)
 - Use the quick runner to verify that the file loads and positions sum to zero at each timestamp it checks. Then use `--full` to compare candidates against the shipped `demo_engineered.py` under matching settings. Record the code version, inputs, and results so the comparison can be repeated. [Starter kit](../../../../requirements/README.md#quick-start)
-- Use `--gauge-fix` with the current Season 2 city map from the contest page to assess novelty offline. Aim for at least 60° from the nearest published city. Reserve the map for candidate selection and feed the predictor the competition features. [Signal cities and novelty](../../../../requirements/COMPETITION.md#signal-cities-and-novelty)
+- Use `--gauge-fix` with the current Season 2 city map from the contest page to assess novelty offline. Record the nearest published city and its measured distance. Reserve the map for candidate selection and feed the predictor the competition features. [Signal cities and novelty](../../../../requirements/COMPETITION.md#signal-cities-and-novelty)
 
 ## Success criteria
 
 | Milestone | Evidence |
 | --- | --- |
-| **Local submission decision** | Require positive net Sharpe on the full walk-forward run and a higher net Sharpe than `demo_engineered.py` on the same data and settings. Confirm zero-sum output and stay within the CPU limits of 4 minutes for training and 60 seconds per prediction call, with peak memory under 8 GB. |
+| **Local submission decision** | Require positive net Sharpe on the full walk-forward run and a higher net Sharpe than `demo_engineered.py` on the same data and settings. Also require a measured nearest-city distance of at least 60° using the current Season 2 map. Hold the candidate if the distance is below 60° or the comparison is unavailable. Confirm zero-sum output and stay within the CPU limits of 4 minutes for training and 60 seconds per prediction call, with peak memory under 8 GB. |
 | **First official milestone** | The submission passes the entry checks, including the shuffled-label overfitting gate and the row-position and flat-period checks. |
 | **Competitive goal** | The entry reaches the settled quality set. The contest ranks positive-Sharpe signals and admits one only if the absolute value of its time-averaged cross-sectional correlation with each signal already in that cycle’s quality set or the season’s legacy pot is at most 0.5. The top three quality signals earn prizes. |
 

@@ -24,8 +24,8 @@ Enter AlphaNova’s Season 2 Cycle 1 with a reproducible signal that can add dis
   - **success:** A full walk-forward comparison over matching periods and settings shows positive candidate net Sharpe and strictly higher net Sharpe than the shipped `demo_engineered.py`. The run record supports reproducing the result.
 
 - **CAP-3**
-  - **intent:** Assess a candidate’s distinctiveness before submission.
-  - **success:** Record its nearest-city distance against the current Season 2 map using `--gauge-fix`, with 60° or more as the target. Record an unavailable comparison when no valid map is present.
+  - **intent:** Determine whether a candidate clears the local novelty requirement.
+  - **success:** The candidate clears the requirement only with a measured nearest-city distance of at least 60° against the current Season 2 map. Hold it if the distance is below 60° or the comparison is unavailable.
 
 - **CAP-4**
   - **intent:** Track the official outcome of the selected Cycle 1 entry.
@@ -45,8 +45,4 @@ Enter AlphaNova’s Season 2 Cycle 1 with a reproducible signal that can add dis
 
 ## Success signal
 
-A Cycle 1 entry that clears the local net-Sharpe bar passes official checks and appears in the settled quality set.
-
-## Open Questions
-
-- If the local performance bar is met but the current city comparison is unavailable or comes in below 60°, should the candidate still be submitted?
+A Cycle 1 entry clears the local net Sharpe and novelty requirements, passes official checks, and appears in the settled quality set.
