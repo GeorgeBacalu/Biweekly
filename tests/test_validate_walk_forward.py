@@ -6,7 +6,7 @@ import py_compile
 import subprocess
 import sys
 import unittest
-from contextlib import chdir, contextmanager, redirect_stdout
+from contextlib import chdir, contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from shutil import rmtree
 from types import ModuleType, SimpleNamespace
@@ -73,7 +73,7 @@ def scored_calls(periods):
             for period in periods for phase in ("train", "predict")]
 
 
-def fake_worker(_, attempt, name, mode, role, artifact, manifest_sha, settings_sha):
+def fake_worker(_, attempt, name, mode, role, artifact, manifest_sha, settings_sha, *, novelty=None):
     directory = attempt / name
     directory.mkdir()
     validator.atomic_json(directory / "runtime.json", RUNTIME)
@@ -83,7 +83,8 @@ def fake_worker(_, attempt, name, mode, role, artifact, manifest_sha, settings_s
         "mode": mode, "artifact": artifact, "runtime": RUNTIME, "runner_result": {},
         "checks": [], "failures": [], "peak_rss_bytes": 1_000_000,
         "input_manifest": {"path": "inputs-before.json", "sha256": manifest_sha},
-        "settings": {"path": "settings.json", "sha256": settings_sha},
+        "settings": {"path": validator.NOVELTY_SETTINGS if mode == "novelty" else "settings.json",
+                     "sha256": settings_sha},
         "files": {filename: f"{name}/{filename}" for filename in ("runtime.json", "stdout.log", "stderr.log")},
         "calls": [],
     }
@@ -101,6 +102,12 @@ def fake_worker(_, attempt, name, mode, role, artifact, manifest_sha, settings_s
         if role == "candidate":
             phase["observed_scored_rows"] = EXPECTED
             phase["exposure"] = {"passed": True}
+    elif mode == "novelty":
+        phase["runner_result"] = result(SCORES[role])
+        phase["calls"] = scored_calls(EXPECTED)
+        phase["checks"].append(validator.check("worker_artifact", True))
+        phase["novelty"] = {"city_novelty_deg": 60.0, "nearest_city": "nearest",
+                            "map_sha256": validator.fingerprint(Path(novelty["map_path"]))["sha256"]}
     return phase
 
 
@@ -307,6 +314,235 @@ class CollectionTests(unittest.TestCase):
                                                "requirements/evaluation.py"])
 
 
+class DecisionTests(unittest.TestCase):
+    def setUp(self):
+        root = self.enterContext(workspace())
+        self.root = root
+        self.data = fixture(root)
+        gauges = self.data / "gauge"
+        gauges.mkdir()
+        for period in EXPECTED:
+            (gauges / f"{period}.small.gauge.npy").write_bytes(period.encode())
+        self.map = root / "diagnostic.parquet"
+        self.map.write_bytes(b"scored map")
+        self.fresh_map = root / "download.parquet"
+        self.fresh_map.write_bytes(self.map.read_bytes())
+
+    def collect(self, *, worker_fn=fake_worker, confirm=True, inputs=None, city_map=True):
+        with (patch.object(validator, "run_worker", side_effect=worker_fn),
+              patch("builtins.input", side_effect=inputs or ["yes", str(self.fresh_map)]) as prompt,
+              redirect_stdout(io.StringIO())):
+            attempt, cap2 = validator.collect(self.root, city_map=self.map if city_map else None,
+                                              confirm_current_map=confirm)
+        decision = validator.read_json(attempt / cap2["decision"]["path"])
+        novelty = validator.read_json(attempt / cap2["novelty"]["path"])
+        self.assertEqual(decision["status"], cap2["decision"]["status"])
+        return SimpleNamespace(attempt=attempt, cap2=cap2, decision=decision, novelty=novelty, prompt=prompt,
+                               codes={reason["code"] for reason in decision["reasons"]})
+
+    def test_ready_preserves_exact_scores_map_and_candidate_digests(self):
+        observed = self.collect()
+        self.assertEqual(observed.decision["status"], "ready")
+        metrics = observed.decision["metrics"]
+        self.assertEqual(metrics["city_novelty_deg"], 60.0)
+        self.assertEqual(metrics["candidate"], SCORES["candidate"])
+        self.assertEqual(metrics["candidate_minus_control"], SCORES["candidate"] - SCORES["control"])
+        self.assertEqual(observed.decision["candidate_sha256"], observed.cap2["artifacts"]["candidate"]["sha256"])
+        city_map = observed.novelty["map"]
+        self.assertEqual((observed.attempt / city_map["staged"]).read_bytes(), self.map.read_bytes())
+        self.assertEqual(observed.decision["scored_map_sha256"], city_map["sha256"])
+        confirmation = observed.novelty["confirmation"]
+        self.assertEqual(confirmation["source"], validator.CITY_MAP_PAGE)
+        self.assertEqual(confirmation["local_path"], str(self.fresh_map))
+        self.assertEqual(confirmation["verified_at"], city_map["verified_at"])
+        self.assertTrue(confirmation["verified_at"].endswith("+00:00"))
+        self.assertEqual(observed.novelty["gauges_before"], observed.novelty["gauges_after"])
+        self.assertEqual(len(observed.novelty["gauges_after"]), 31)
+        self.assertFalse(validator.read_json(observed.attempt / observed.cap2["settings"]["path"])["gauge_fix"])
+        settings = observed.novelty["settings"]
+        settings_path = observed.attempt / settings["path"]
+        self.assertEqual(settings, observed.novelty["phase"]["settings"])
+        self.assertEqual(settings["sha256"], validator.fingerprint(settings_path)["sha256"])
+        self.assertTrue(validator.read_json(settings_path)["gauge_fix"])
+
+    def test_raw_sharpe_and_distance_block_confirmation(self):
+        for score, code in ((0.0, "candidate_sharpe_positive"), (-0.1, "candidate_sharpe_positive"),
+                            (SCORES["baseline"], "candidate_beats_baseline"),
+                            (float("nan"), "candidate_sharpe_finite"), (float("inf"), "candidate_sharpe_finite")):
+            with self.subTest(score=score), patch.dict(SCORES, candidate=score):
+                observed = self.collect()
+                self.assertEqual(observed.decision["status"], "hold")
+                self.assertIn(code, observed.codes)
+                self.assertEqual(observed.novelty["confirmation"]["status"], "prerequisites_failed")
+                observed.prompt.assert_not_called()
+
+        def close_distance(*args, **kwargs):
+            phase = fake_worker(*args, **kwargs)
+            if args[3] == "novelty":
+                phase["novelty"]["city_novelty_deg"] = 59.96
+            return phase
+
+        observed = self.collect(worker_fn=close_distance)
+        self.assertEqual(observed.cap2["status"], "passed")
+        self.assertEqual(observed.decision["status"], "hold")
+        self.assertEqual(observed.decision["metrics"]["city_novelty_deg"], 59.96)
+        self.assertEqual(round(observed.decision["metrics"]["city_novelty_deg"], 1), 60.0)
+        self.assertIn("city_distance_threshold", observed.codes)
+        observed.prompt.assert_not_called()
+
+    def test_confirmation_requires_fresh_matching_bytes_and_operator_attestation(self):
+        cases = [(False, None, "not_requested"), (True, ["no"], "declined"),
+                 (True, [EOFError], "declined"), (True, ["yes", ""], "declined"),
+                 (True, ["yes", str(self.root / "missing.parquet")], "unreadable")]
+        for requested, inputs, status in cases:
+            with self.subTest(status=status):
+                observed = self.collect(confirm=requested, inputs=inputs)
+                self.assertEqual(observed.decision["status"], "hold")
+                self.assertEqual(observed.novelty["confirmation"]["status"], status)
+                self.assertIn("current_map_confirmation", observed.codes)
+                self.assertIsNone(observed.novelty["map"]["verified_at"])
+
+        self.fresh_map.write_bytes(b"new published map")
+        changed = self.collect()
+        self.assertEqual(changed.decision["status"], "hold")
+        self.assertEqual(changed.novelty["confirmation"]["status"], "map_changed",
+                         (changed.decision["reasons"], changed.novelty["checks"], changed.cap2["errors"]))
+        self.assertNotEqual(changed.novelty["confirmation"]["sha256"], changed.decision["scored_map_sha256"])
+        self.map.write_bytes(self.fresh_map.read_bytes())
+        fresh = self.collect()
+        self.assertEqual(fresh.decision["status"], "ready",
+                         (fresh.decision["reasons"], fresh.novelty["checks"], fresh.cap2["errors"]))
+        self.assertNotEqual(changed.decision["scored_map_sha256"], fresh.decision["scored_map_sha256"])
+        self.assertEqual(changed.decision["candidate_sha256"], fresh.decision["candidate_sha256"])
+        self.assertEqual((changed.attempt / changed.novelty["map"]["staged"]).read_bytes(), b"scored map")
+
+    def test_cap2_and_novelty_failures_remain_separate(self):
+        def incomplete(*args, **kwargs):
+            phase = fake_worker(*args, **kwargs)
+            if args[2] == "candidate-behavior":
+                phase["checks"].append(validator.check("repeat", False))
+            if args[2] == "candidate-novelty":
+                phase["checks"].append(validator.check("raw_gauge", False, period="031", error="invalid gauge"))
+                phase["novelty"].update(city_novelty_deg=None, nearest_city="N/A")
+            return phase
+
+        observed = self.collect(worker_fn=incomplete)
+        self.assertEqual(observed.cap2["status"], "failed")
+        self.assertEqual(observed.decision["status"], "hold")
+        self.assertTrue({"cap2_failed", "novelty_worker", "city_distance_available", "nearest_city_available"}
+                        <= observed.codes)
+        self.assertNotIn("candidate-novelty", observed.cap2["phases"])
+        self.assertTrue(any(item["name"] == "raw_gauge" and not item["passed"]
+                            for item in observed.novelty["phase"]["checks"]))
+        reason = next(item for item in observed.decision["reasons"] if item["code"] == "novelty_worker")
+        self.assertIn({"name": "raw_gauge", "period": "031", "error": "invalid gauge"}, reason["failed_checks"])
+        observed.prompt.assert_not_called()
+
+    def test_missing_map_retains_passing_cap2_and_hold(self):
+        observed = self.collect(city_map=False)
+        self.assertEqual(observed.cap2["status"], "passed")
+        self.assertEqual(observed.decision["status"], "hold")
+        self.assertIn("map_staged", observed.codes)
+        self.assertEqual(observed.novelty["phase"], {})
+        observed.prompt.assert_not_called()
+
+    def test_rechecks_candidate_and_inputs_after_confirmation(self):
+        original = validator.confirm_city_map
+
+        def confirm(scored_sha, staged_map):
+            attempt = staged_map.parent
+            (attempt / "artifacts" / "weighted_vote.py").write_bytes(b"changed candidate")
+            (self.data / "009.small.returns.parquet").write_bytes(b"changed inputs")
+            return original(scored_sha, staged_map)
+
+        with patch.object(validator, "confirm_city_map", side_effect=confirm):
+            observed = self.collect()
+        self.assertEqual(observed.novelty["confirmation"]["status"], "confirmed")
+        self.assertEqual(observed.decision["status"], "hold")
+        self.assertIn("candidate_digest", observed.codes)
+        self.assertIn("decision_input_drift", observed.codes)
+        self.assertNotEqual(observed.decision["candidate_at_decision"]["sha256"],
+                            observed.decision["candidate_sha256"])
+
+    def test_confirmation_rejects_the_snapshot_and_its_alias(self):
+        original = validator.confirm_city_map
+
+        for alias in (False, True):
+            def confirm(scored_sha, staged_map):
+                supplied = staged_map
+                if alias:
+                    supplied = staged_map.with_name("alias.parquet")
+                    os.link(staged_map, supplied)
+                with patch("builtins.input", side_effect=["yes", str(supplied)]):
+                    return original(scored_sha, staged_map)
+
+            with self.subTest(alias=alias), patch.object(validator, "confirm_city_map", side_effect=confirm):
+                observed = self.collect()
+                self.assertEqual(observed.novelty["confirmation"]["status"], "staged_map",
+                                 (observed.decision["reasons"], observed.novelty["checks"], observed.cap2["errors"]))
+                self.assertEqual(observed.decision["status"], "hold")
+                self.assertIn("current_map_confirmation", observed.codes)
+
+    def test_confirmation_prompt_errors_are_recorded(self):
+        errors = (OSError("stdin unavailable"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid input"))
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                observed = self.collect(inputs=["yes", error])
+                self.assertEqual(observed.decision["status"], "hold")
+                self.assertEqual(observed.novelty["confirmation"]["status"], "prompt_error")
+                reason = next(item for item in observed.decision["reasons"] if item["code"] == "current_map_confirmation")
+                self.assertTrue(reason["error"].startswith(type(error).__name__))
+
+    def test_confirmation_rechecks_map_and_gauges_independently(self):
+        original = validator.confirm_city_map
+        for drift in ("map", "gauge"):
+            def confirm(scored_sha, staged_map):
+                confirmation = original(scored_sha, staged_map)
+                path = staged_map if drift == "map" else self.data / "gauge" / "001.small.gauge.npy"
+                path.write_bytes(b"replaced while awaiting confirmation")
+                return confirmation
+
+            with self.subTest(drift=drift), patch.object(validator, "confirm_city_map", side_effect=confirm):
+                observed = self.collect()
+                self.assertEqual(observed.novelty["confirmation"]["status"], "confirmed")
+                self.assertEqual(observed.decision["status"], "hold")
+                self.assertEqual(observed.codes, {f"decision_{drift}_drift"})
+
+    def test_interrupt_outside_worker_dispatch_blocks_novelty(self):
+        with patch.object(validator, "evaluate_phase", side_effect=KeyboardInterrupt):
+            observed = self.collect()
+        self.assertTrue(observed.cap2["phases"]["metadata"]["passed"])
+        self.assertTrue(observed.cap2["errors"][0]["interrupted"])
+        self.assertEqual(observed.cap2["status"], "failed")
+        self.assertEqual(observed.novelty["phase"], {})
+        self.assertEqual(observed.decision["status"], "hold")
+        observed.prompt.assert_not_called()
+
+    def test_complete_novelty_with_different_sharpe_blocks_confirmation(self):
+        def different(*args, **kwargs):
+            phase = fake_worker(*args, **kwargs)
+            if args[3] == "novelty":
+                phase["runner_result"]["net_sharpe"] += 0.000001
+            return phase
+
+        observed = self.collect(worker_fn=different)
+        self.assertEqual(observed.cap2["status"], "passed")
+        self.assertTrue(observed.novelty["phase"]["passed"])
+        self.assertEqual(observed.decision["status"], "hold")
+        self.assertIn("candidate_score_agreement", observed.codes)
+        observed.prompt.assert_not_called()
+
+    def test_cli_prints_hold_and_returns_success_when_cap2_passes(self):
+        stdout = io.StringIO()
+        collect = validator.collect
+        with (patch.object(sys, "argv", ["validate_walk_forward.py", "--city-map", str(self.map)]),
+              patch.object(validator, "collect", side_effect=lambda **kwargs: collect(self.root, **kwargs)),
+              patch.object(validator, "run_worker", side_effect=fake_worker), redirect_stdout(stdout)):
+            self.assertEqual(validator.main(), 0)
+        self.assertIn("Evidence collection passed:", stdout.getvalue())
+        self.assertIn("Decision hold:", stdout.getvalue())
+
+
 class ExposureAndWorkerTests(unittest.TestCase):
     def test_timeout_preserves_partial_evidence_and_child_environment_is_forced(self):
         def timeout(arguments, **kwargs):
@@ -444,6 +680,242 @@ class ExposureAndWorkerTests(unittest.TestCase):
                 checks = {entry["name"]: entry for entry in phase["checks"]}
                 self.assertEqual(checks["model_calls"]["passed"], passed)
                 self.assertTrue(checks["peak_resident_bytes"]["passed"])
+
+
+class NoveltyScorerTests(unittest.TestCase):
+    @staticmethod
+    def city_frame(ids=("nearest", "farther"), axis=1):
+        cities = np.zeros((len(ids), 19))
+        cities[0, axis] = 1
+        if len(ids) > 1:
+            cities[1:, 0] = -1
+        table = pd.DataFrame(cities, columns=[f"city_dim_{index}" for index in range(19)])
+        return table.assign(predictor_id=list(ids), world=validator.CITY_WORLD)
+
+    @staticmethod
+    def scoring_frames():
+        hours = pd.Index(np.arange(15), name="hour")
+        assets = pd.Index([f"ticker.{number}" for number in range(1, 21)], name="asset")
+        columns = pd.MultiIndex.from_product([["Feature.1"], assets], names=["feature", "asset"])
+        features = pd.DataFrame(0.0, index=hours, columns=columns)
+        returns = pd.DataFrame(np.zeros((15, 20)), index=hours, columns=assets)
+        returns.iloc[:, 0] = np.arange(15)
+        return {"features": features, "target": returns, "returns": returns}
+
+    @staticmethod
+    def write_gauge(kit, period, rows, value=1.0):
+        gauge_dir = kit / validator.DATA_DIR / "gauge"
+        gauge_dir.mkdir(parents=True, exist_ok=True)
+        path = gauge_dir / f"{period}.small.gauge.npy"
+        matrix = np.zeros((rows, 19, 20))
+        matrix[:, 0, 0] = 1
+        matrix[0, 0, 0] = value
+        np.save(path, matrix)
+        return path
+
+    def score(self, kit, attempt, table, *, gauge_rows=3, bad_value=None, map_sha=None, replace_gauge=None):
+        with patch.object(sys, "path", [str(KIT), *sys.path]):
+            runner = importlib.import_module("runner")
+            walkforward = importlib.import_module("walkforward")
+            predictor = importlib.import_module("predictor")
+            importlib.import_module("city_tools")
+
+        data = self.scoring_frames()
+        periods = ["001", "002"] if replace_gauge else ["001"]
+
+        class GaugeFixture(predictor.Predictor):
+            def train(self, features, target):
+                pass
+
+            def predict(self, features):
+                positions = np.zeros((len(features), 20))
+                positions[:, :2] = [1.0, -1.0]
+                return pd.DataFrame(positions, index=features.index, columns=features.columns.get_level_values(1))
+
+        (kit / validator.DATA_DIR / "gauge").mkdir(parents=True, exist_ok=True)
+        if gauge_rows is not None:
+            for period in periods:
+                self.write_gauge(kit, period, gauge_rows, 1.0 if bad_value is None else bad_value)
+
+        def load_period(period, *args, **kwargs):
+            if period == replace_gauge:
+                self.write_gauge(kit, period, gauge_rows, -1.0)
+            return data
+
+        source = kit / "source.parquet"
+        table.to_parquet(source)
+        staged = validator.stage_city_map(attempt, source)
+        expected = dict.fromkeys(periods, 3)
+        validator.atomic_json(attempt / "novelty-inputs.json", {
+            "expected_rows": expected, "map_path": str(attempt / staged["staged"]),
+            "map_sha256": map_sha or staged["sha256"],
+            "gauge_sha256": {path: entry.get("sha256")
+                             for path, entry in validator.gauge_manifest(kit, expected).items()},
+        })
+        journal, output = Journal(attempt), {}
+        abort = self.assertRaisesRegex(ValueError, "Raw gauge digest differs") if replace_gauge else nullcontext()
+        with (chdir(kit), patch.object(runner, "load_predictor_class_from_file", return_value=GaugeFixture),
+              patch.object(walkforward, "load_period", side_effect=load_period),
+              patch.object(walkforward, "list_periods", return_value=periods), redirect_stdout(io.StringIO()), abort):
+            worker.score(journal, attempt / "candidate.py", attempt, "novelty", "candidate", output)
+        events = validator.read_events(journal.path)
+        checks = {event["check"]["name"]: event["check"] for event in events if event["event"] == "check"}
+        observation = next(event["observation"] for event in events if event["event"] == "novelty_result")
+        return checks, observation, output.get("runner_result"), staged
+
+    def test_shipped_gauge_and_compare_use_each_attempt_map(self):
+        with workspace() as kit:
+            shared = kit / "signal_db" / "signal_cities_ambient_coords.parquet"
+            shared.parent.mkdir()
+            shared.write_bytes(b"shared file must stay untouched")
+            results = []
+            for number, (axis, distance) in enumerate(((1, 90.0), (0, 0.0))):
+                attempt = kit / f"attempt-{number}"
+                attempt.mkdir()
+                checks, observation, sharpe, staged = self.score(kit, attempt, self.city_frame(axis=axis))
+                for name in ("city_map_valid", "raw_gauge", "period_gauge_fixed", "gauge_aggregate",
+                             "gauge_period_coverage", "map_comparison", "nearest_city"):
+                    self.assertTrue(checks[name]["passed"], checks[name])
+                self.assertEqual(checks["raw_gauge"]["shape"], [3, 19, 20])
+                self.assertEqual(checks["raw_gauge"]["nonfinite_values"], 0)
+                self.assertEqual(observation["gauge_fixed_shape"], [3, 19])
+                self.assertEqual(observation["gauge_fixed_per_period"], {"001": [3]})
+                self.assertEqual(observation["city_novelty_deg"], distance)
+                self.assertEqual(observation["comparison_rows"], 2)
+                self.assertEqual(observation["nearest_city"], "nearest")
+                self.assertEqual(observation["map_sha256"], staged["sha256"])
+                self.assertEqual(sharpe["n_observations"], 3)
+                results.append((observation, sharpe))
+            self.assertNotEqual(results[0][0]["map_sha256"], results[1][0]["map_sha256"])
+            self.assertEqual(results[0][1], results[1][1])
+            self.assertEqual(shared.read_bytes(), b"shared file must stay untouched")
+
+    def test_shipped_sharpe_coverage_does_not_hide_missing_or_truncated_gauges(self):
+        for rows in (None, 2, 4):
+            with self.subTest(gauge_rows=rows), workspace() as kit:
+                checks, observation, sharpe, _ = self.score(kit, kit, self.city_frame(), gauge_rows=rows)
+                self.assertEqual(sharpe["n_observations"], 3)
+                self.assertEqual(observation["gauge_fixed_rows"], min(rows or 0, 3))
+                self.assertFalse(checks["raw_gauge"]["passed"])
+                self.assertIs(checks["gauge_period_coverage"]["passed"], rows == 4)
+                self.assertEqual(checks["raw_gauge"].get("shape"), [rows, 19, 20] if rows else None)
+
+    def test_malformed_city_map_retains_native_sharpe_and_gauge_evidence(self):
+        valid = self.city_frame()
+        cases = {
+            "empty": valid.iloc[:0], "world": valid.assign(world="other"),
+            "duplicate": self.city_frame(ids=("same", "same")),
+            "missing_dim": valid.drop(columns="city_dim_18"), "extra_dim": valid.assign(city_dim_19=1.0),
+            "nonfinite": valid.assign(city_dim_1=float("inf")), "zero": valid.assign(city_dim_1=0.0),
+            "sub_cutoff_norm": valid.assign(city_dim_1=1e-13),
+            "overflowing_norm": valid.assign(city_dim_1=1e308),
+        }
+        for name, table in cases.items():
+            with self.subTest(name=name), workspace() as kit:
+                checks, observation, sharpe, _ = self.score(kit, kit, table)
+                self.assertFalse(checks["city_map_valid"]["passed"])
+                self.assertTrue(checks["gauge_aggregate"]["passed"])
+                self.assertFalse(checks["map_comparison"]["passed"])
+                self.assertEqual(observation["gauge_fixed_rows"], 3)
+                self.assertIsNone(observation["city_novelty_deg"])
+                self.assertEqual(sharpe["n_observations"], 3)
+
+    def test_nonfinite_raw_gauge_and_wrong_map_digest_are_reported(self):
+        with workspace() as kit:
+            checks, observation, sharpe, _ = self.score(kit, kit, self.city_frame(),
+                                                       bad_value=float("nan"), map_sha="wrong digest")
+        self.assertFalse(checks["raw_gauge"]["passed"])
+        self.assertEqual(checks["raw_gauge"]["nonfinite_values"], 1)
+        self.assertFalse(checks["city_map_valid"]["passed"])
+        self.assertIsNone(observation["map_sha256"])
+        self.assertEqual(sharpe["n_observations"], 3)
+
+    def test_replaced_gauge_is_rejected_at_native_load(self):
+        with workspace() as kit:
+            checks, observation, sharpe, _ = self.score(kit, kit, self.city_frame(), replace_gauge="001")
+            changed = validator.fingerprint(kit / validator.DATA_DIR / "gauge" / "001.small.gauge.npy")
+        self.assertIsNone(sharpe)
+        self.assertEqual(observation["gauge_sha256_per_period"], {"001": changed["sha256"]})
+        self.assertEqual(observation["gauge_fixed_per_period"], {})
+        self.assertFalse(checks["gauge_period_coverage"]["passed"])
+
+    def test_native_abort_preserves_partial_gauge_coverage(self):
+        with workspace() as kit:
+            checks, observation, sharpe, _ = self.score(kit, kit, self.city_frame(), replace_gauge="002")
+        self.assertIsNone(sharpe)
+        self.assertEqual(checks["raw_gauge"]["period"], "002")
+        self.assertNotEqual(checks["raw_gauge"]["sha256"], checks["raw_gauge"]["expected_sha256"])
+        self.assertTrue(checks["period_gauge_fixed"]["passed"])
+        self.assertEqual(observation["gauge_fixed_per_period"], {"001": [3]})
+        self.assertEqual(observation["gauge_fixed_observed_rows"], 3)
+        self.assertIsNone(observation["gauge_fixed_shape"])
+
+    def test_candidate_snapshot_matches_the_hashed_bytes_after_replacement(self):
+        with workspace() as attempt:
+            artifact = attempt / "candidate.py"
+            artifact.write_bytes(SOURCE)
+            directory = attempt / "worker"
+            directory.mkdir()
+            expected_sha = validator.fingerprint(artifact)["sha256"]
+            original = Path.read_bytes
+
+            def read_and_replace(path):
+                contents = original(path)
+                if path == artifact:
+                    artifact.write_bytes(b"replaced candidate")
+                return contents
+
+            def observe(_journal, snapshot, *_args):
+                self.assertNotEqual(snapshot, artifact)
+                self.assertEqual(snapshot.name, artifact.name)
+                self.assertEqual(snapshot.read_bytes(), SOURCE)
+
+            with (patch.object(sys, "argv", ["worker", "novelty", "candidate", str(artifact), str(directory)]),
+                  patch.object(sys, "path", list(sys.path)), patch.object(sys, "meta_path", list(sys.meta_path)),
+                  patch.object(Path, "read_bytes", read_and_replace), patch.object(worker, "score", side_effect=observe),
+                  patch.object(worker, "load_runtime", return_value=RUNTIME)):
+                self.assertEqual(worker.main(), 0)
+            result = validator.read_json(directory / "result.json")
+            self.assertEqual(result["artifact_sha256"], expected_sha)
+            self.assertEqual(artifact.read_bytes(), b"replaced candidate")
+
+    def test_novelty_subprocess_uses_staged_artifacts_and_passes(self):
+        with workspace() as attempt:
+            kit = attempt / "kit"
+            data = kit / validator.DATA_DIR
+            data.mkdir(parents=True)
+            for name in ("runner.py", "walkforward.py", "data_loader.py", "evaluation.py", "predictor.py", "city_tools.py"):
+                (kit / name).write_bytes((KIT / name).read_bytes())
+            for name, frame in self.scoring_frames().items():
+                frame.to_parquet(data / f"001.small.{name}.parquet")
+            gauge = self.write_gauge(kit, "001", 3)
+            artifact = attempt / "candidate.py"
+            artifact.write_text(
+                "import numpy as np\nimport pandas as pd\nfrom predictor import Predictor\n"
+                "class Fixture(Predictor):\n"
+                "    def train(self, features, target):\n        pass\n"
+                "    def predict(self, features):\n"
+                "        values = np.zeros((len(features), 20))\n"
+                "        values[:, :2] = [1.0, -1.0]\n"
+                "        return pd.DataFrame(values, index=features.index, columns=features.columns.get_level_values(1))\n",
+                encoding="utf-8",
+            )
+            city_map = attempt / "city-map.parquet"
+            self.city_frame().to_parquet(city_map)
+            gauge_sha = validator.fingerprint(gauge)["sha256"]
+            map_sha = validator.fingerprint(city_map)["sha256"]
+            record = validator.run_worker(
+                kit, attempt, "candidate-novelty", "novelty", "candidate",
+                {"staged": artifact.name, **validator.fingerprint(artifact)}, "inputs", "novelty settings",
+                novelty={"expected_rows": {"001": 3}, "map_path": str(city_map), "map_sha256": map_sha,
+                         "gauge_sha256": {gauge.relative_to(kit).as_posix(): gauge_sha}},
+            )
+            validator.evaluate_phase("candidate-novelty", record, {"001": 3}, record["runtime"])
+            self.assertTrue(record["passed"], record)
+            self.assertEqual(record["novelty"]["map_sha256"], map_sha)
+            self.assertEqual(record["novelty"]["gauge_sha256_per_period"], {"001": gauge_sha})
+            self.assertEqual(record["novelty"]["gauge_fixed_rows"], 3)
+            self.assertEqual((attempt / record["files"]["artifact_snapshot"]).read_bytes(), artifact.read_bytes())
 
 
 class ScorerObserverTests(unittest.TestCase):

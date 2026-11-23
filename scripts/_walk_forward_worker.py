@@ -1,6 +1,7 @@
 """Observe the shipped scorer from one isolated CAP-2 worker process."""
 
 import ctypes
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -10,19 +11,23 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import ExitStack
 from importlib.machinery import SourceFileLoader
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 if __package__:
     from .validate_walk_forward import (
-        CPU_ENV, DATA_DIR, PERIODS, PREDICT_LIMIT, REPRESENTATIVE_PERIODS, STARTUP_ALLOWANCE,
-        TRAIN_LIMIT, UNIVERSE, ZERO_SUM_TOLERANCE, atomic_json, check, fingerprint, read_events, score_value,
+        CITY_WORLD, CPU_ENV, DATA_DIR, GAUGE_DIMENSIONS, PERIODS, PREDICT_LIMIT, REPRESENTATIVE_PERIODS,
+        STARTUP_ALLOWANCE, TRAIN_LIMIT, UNIVERSE, ZERO_SUM_TOLERANCE, atomic_json, check, finite_number,
+        fingerprint, read_events, read_json, score_value,
     )
 else:
     from validate_walk_forward import (
-        CPU_ENV, DATA_DIR, PERIODS, PREDICT_LIMIT, REPRESENTATIVE_PERIODS, STARTUP_ALLOWANCE,
-        TRAIN_LIMIT, UNIVERSE, ZERO_SUM_TOLERANCE, atomic_json, check, fingerprint, read_events, score_value,
+        CITY_WORLD, CPU_ENV, DATA_DIR, GAUGE_DIMENSIONS, PERIODS, PREDICT_LIMIT, REPRESENTATIVE_PERIODS,
+        STARTUP_ALLOWANCE, TRAIN_LIMIT, UNIVERSE, ZERO_SUM_TOLERANCE, atomic_json, check, finite_number,
+        fingerprint, read_events, read_json, score_value,
     )
 
 
@@ -237,17 +242,192 @@ def summarize_result(result):
     return summary
 
 
+def validate_city_map(path):
+    import numpy as np
+    import pandas as pd
+
+    table = pd.read_parquet(path)
+    dimensions = [f"city_dim_{number}" for number in range(GAUGE_DIMENSIONS[0])]
+    actual_dimensions = {column for column in table.columns if column.startswith("city_dim_")}
+    if (table.empty or not table.columns.is_unique or not {"predictor_id", "world"}.issubset(table.columns)
+            or actual_dimensions != set(dimensions)):
+        raise ValueError("City map requires predictor_id, world and exactly 19 coordinate columns")
+    if not bool(table["world"].fillna("").eq(CITY_WORLD).all()):
+        raise ValueError(f"City map must contain only {CITY_WORLD} rows")
+    ids = table["predictor_id"]
+    if not ids.is_unique or not all(isinstance(value, str) and value.strip() for value in ids):
+        raise ValueError("City map identifiers must be unique nonempty strings")
+    if not all(dtype.kind in "iuf" for dtype in table[dimensions].dtypes):
+        raise ValueError("City map coordinates must be real numbers")
+    vectors = table[dimensions].to_numpy()
+    with np.errstate(over="ignore", invalid="ignore"):
+        norms = np.linalg.norm(vectors, axis=1)
+    if not np.isfinite(vectors).all() or not np.isfinite(norms).all() or not (norms >= 1e-12).all():
+        raise ValueError("City map vectors must have finite coordinates and a finite norm of at least 1e-12")
+    return set(ids)
+
+
+class GaugeLoader:
+    """Observe NumPy loads in the shipped walk-forward module only."""
+
+    def __init__(self, numpy, load):
+        self.numpy = numpy
+        self.load = load
+
+    def __getattr__(self, name):
+        return getattr(self.numpy, name)
+
+
+class NoveltyObserver:
+    def __init__(self, journal, request, city_tools):
+        self.journal = journal
+        self.expected = request["expected_rows"]
+        self.map_path = Path(request["map_path"])
+        self.map_sha = request["map_sha256"]
+        self.expected_gauges = request["gauge_sha256"]
+        self.compute = city_tools.compute_gauge_fixed
+        self.compare = city_tools.compare_to_cities
+        self.identifiers = set()
+        self.compared_sha = None
+        self.fixed = {}
+        self.observed_gauges = {}
+
+    def validate_map(self):
+        journal = self.journal
+        journal.enter("city_map_validation")
+        try:
+            if fingerprint(self.map_path)["sha256"] != self.map_sha:
+                raise ValueError("Staged map digest does not match the novelty request")
+            identifiers = validate_city_map(self.map_path)
+            if fingerprint(self.map_path)["sha256"] != self.map_sha:
+                raise ValueError("Staged map changed during validation")
+            self.identifiers = identifiers
+            journal.check("city_map_valid", True, rows=len(identifiers), sha256=self.map_sha, world=CITY_WORLD)
+        except Exception as exc:
+            journal.check("city_map_valid", False, error=exception_text(exc))
+
+    def load_gauge(self, filename):
+        import numpy as np
+
+        path = Path(filename)
+        journal = self.journal
+        journal.enter("raw_gauge_validation")
+        period = journal.period
+        expected_sha = self.expected_gauges.get(path.as_posix())
+        details = {"path": path.as_posix(), "expected_shape": (self.expected.get(period), *GAUGE_DIMENSIONS),
+                   "expected_sha256": expected_sha, "sha256": None}
+        self.observed_gauges[period] = None
+        try:
+            contents = path.read_bytes()
+            sha = hashlib.sha256(contents).hexdigest()
+            self.observed_gauges[period] = details["sha256"] = sha
+            if sha != expected_sha:
+                raise ValueError("Raw gauge digest differs from the before-scoring manifest")
+            gauge = np.load(BytesIO(contents), allow_pickle=False)
+            details.update(shape=gauge.shape, dtype=str(gauge.dtype))
+            nonfinite = int(np.count_nonzero(~np.isfinite(gauge))) if gauge.dtype.kind in "iuf" else None
+            details.update(nonfinite_values=nonfinite)
+            valid = gauge.shape == details["expected_shape"] and nonfinite == 0
+            journal.check("raw_gauge", valid, **details)
+            return gauge
+        except Exception as exc:
+            journal.check("raw_gauge", False, error=exception_text(exc), **details)
+            raise
+
+    def gauge_fixed(self, predictions, matrices):
+        import numpy as np
+
+        journal = self.journal
+        journal.enter("gauge_fix")
+        expected = (self.expected.get(journal.period), GAUGE_DIMENSIONS[0])
+        try:
+            vectors = self.compute(predictions, matrices)
+        except Exception as exc:
+            journal.check("period_gauge_fixed", False, expected_shape=expected, error=exception_text(exc))
+            raise
+        valid = vectors.shape == expected and bool(np.isfinite(vectors).all())
+        self.fixed.setdefault(journal.period, []).append(vectors.shape[0] if valid else None)
+        journal.check("period_gauge_fixed", valid, shape=vectors.shape, expected_shape=expected)
+        return vectors
+
+    def compare_to_map(self, city):
+        import numpy as np
+
+        journal = self.journal
+        journal.period = None
+        journal.enter("city_comparison")
+        try:
+            if not self.identifiers:
+                raise ValueError("No validated city map is available")
+            if fingerprint(self.map_path)["sha256"] != self.map_sha:
+                raise ValueError("Staged map changed before comparison")
+            comparison = self.compare(city, city_db_path=str(self.map_path))
+            if fingerprint(self.map_path)["sha256"] != self.map_sha:
+                raise ValueError("Staged map changed during comparison")
+            distances = comparison["angular_distance_deg"].to_numpy()
+            covers_map = len(comparison) == len(self.identifiers) and set(comparison["signal_id"]) == self.identifiers
+            valid = covers_map and bool(np.isfinite(distances).all()) and bool(((0 <= distances) & (distances <= 180)).all())
+            journal.check("map_comparison", valid, rows=len(comparison), expected_rows=len(self.identifiers))
+            self.compared_sha = self.map_sha
+            return comparison
+        except Exception as exc:
+            journal.check("map_comparison", False, error=exception_text(exc))
+            raise
+
+    def summarize(self, result):
+        import numpy as np
+
+        journal = self.journal
+        journal.enter("novelty_result")
+        for period in sorted(self.expected.keys() - self.observed_gauges.keys()):
+            journal.period = period
+            path = f"{DATA_DIR}/gauge/{period}.{UNIVERSE}.gauge.npy"
+            journal.check("raw_gauge", False, path=path, expected_sha256=self.expected_gauges.get(path),
+                          sha256=None, error="Native scorer did not load the expected gauge file")
+        journal.period = None
+        vectors = result.get("gauge_fixed")
+        shape = list(vectors.shape) if isinstance(vectors, np.ndarray) else None
+        expected_shape = [sum(self.expected.values()), GAUGE_DIMENSIONS[0]]
+        journal.check("gauge_aggregate", shape == expected_shape and bool(np.isfinite(vectors).all()),
+                      shape=shape, expected_shape=expected_shape)
+        expected_periods = {period: [rows] for period, rows in self.expected.items()}
+        journal.check("gauge_period_coverage", self.fixed == expected_periods,
+                      actual=self.fixed, expected=expected_periods)
+        distance = finite_number(result.get("city_novelty_deg"))
+        nearest = result.get("nearest_city")
+        table = result.get("city_comparison")
+        compared_rows = len(table) if table is not None else 0
+        journal.check("nearest_city", isinstance(nearest, str) and nearest in self.identifiers
+                      and distance is not None and 0 <= distance <= 180 and compared_rows > 0
+                      and nearest == table.iloc[0]["signal_id"] and distance == table.iloc[0]["angular_distance_deg"])
+        journal.emit("novelty_result", observation={
+            "city_novelty_deg": distance, "nearest_city": nearest if isinstance(nearest, str) else None,
+            "map_sha256": self.compared_sha, "map_rows": len(self.identifiers), "comparison_rows": compared_rows,
+            "gauge_fixed_shape": shape, "gauge_fixed_rows": shape[0] if shape else 0,
+            "gauge_fixed_per_period": self.fixed, "gauge_sha256_per_period": self.observed_gauges,
+            "gauge_fixed_observed_rows": sum(rows for counts in self.fixed.values() for rows in counts if rows),
+        })
+
+
 def score(journal, artifact, directory, mode, role, output):
     import numpy as np
     import runner
     import walkforward
 
     exposure = None
+    walkforward_result = {}
     shipped_load = runner.load_predictor_class_from_file
     shipped_period = walkforward.load_period
     shipped_backtest = walkforward.backtest
-    entry_point = "walkforward_full" if mode == "full" else "walkforward_backtest"
+    full = mode in ("full", "novelty")
+    entry_point = "walkforward_full" if full else "walkforward_backtest"
     shipped_walkforward = getattr(runner, entry_point)
+    novelty = None
+    if mode == "novelty":
+        import city_tools
+
+        novelty = NoveltyObserver(journal, read_json(directory / "novelty-inputs.json"), city_tools)
+        novelty.validate_map()
 
     def load_period(period, *args, **kwargs):
         nonlocal exposure
@@ -312,21 +492,35 @@ def score(journal, artifact, directory, mode, role, output):
         return pnl
 
     def walkforward_with_result(*args, **kwargs):
+        nonlocal walkforward_result
         result = shipped_walkforward(*args, **kwargs)
+        walkforward_result = result
         output["runner_result"] = summarize_result(result)
         journal.emit("runner_result", result=output["runner_result"])
         journal.enter("runner_output")
         return result
 
-    with (patch.object(runner, "load_predictor_class_from_file", load_predictor),
+    with (ExitStack() as hooks,
+          patch.object(runner, "load_predictor_class_from_file", load_predictor),
           patch.object(runner, entry_point, walkforward_with_result),
           patch.object(walkforward, "load_period", load_period),
           patch.object(walkforward, "backtest", backtest)):
-        result = runner.validate_submission(
-            str(artifact), output_file=str(directory / "runner.csv"), data_dir=DATA_DIR,
-            universe=UNIVERSE, full=mode == "full", gauge_fix=False,
-            max_train_time=TRAIN_LIMIT, max_predict_time=PREDICT_LIMIT,
-        )
+        if novelty is not None:
+            hooks.enter_context(patch.object(city_tools, "compute_gauge_fixed", novelty.gauge_fixed))
+            hooks.enter_context(patch.object(city_tools, "compare_to_cities", novelty.compare_to_map))
+            hooks.enter_context(patch.object(walkforward, "np", GaugeLoader(np, novelty.load_gauge)))
+        result = {}
+        try:
+            result = runner.validate_submission(
+                str(artifact), output_file=str(directory / "runner.csv"), data_dir=DATA_DIR,
+                universe=UNIVERSE, full=full, gauge_fix=novelty is not None,
+                max_train_time=TRAIN_LIMIT, max_predict_time=PREDICT_LIMIT,
+            )
+        finally:
+            if novelty is not None:
+                period, phase = journal.period, journal.phase
+                novelty.summarize(walkforward_result or result)
+                journal.period, journal.phase = period, phase
     output["runner_result"] = summarize_result(result)
     if not result:
         journal.check("predictor_loaded", False, error="runner returned an empty result")
@@ -511,12 +705,17 @@ def main():
                 collect_metadata(journal, output)
             else:
                 journal.enter("staged_artifact")
-                output["artifact_sha256"] = fingerprint(artifact)["sha256"]
-                journal.emit("artifact_hashed", sha256=output["artifact_sha256"])
+                contents = artifact.read_bytes()
+                snapshot = directory / "scored-artifact" / artifact.name
+                snapshot.parent.mkdir()
+                snapshot.write_bytes(contents)
+                output["artifact_sha256"] = hashlib.sha256(contents).hexdigest()
+                output["artifact_snapshot"] = snapshot.relative_to(directory).as_posix()
+                journal.emit("artifact_hashed", sha256=output["artifact_sha256"], snapshot=output["artifact_snapshot"])
                 if mode == "behavior":
-                    behavior(journal, artifact)
+                    behavior(journal, snapshot)
                 else:
-                    score(journal, artifact, directory, mode, role, output)
+                    score(journal, snapshot, directory, mode, role, output)
     except BaseException as exc:
         journal.fail(exc)
         traceback.print_exc()
