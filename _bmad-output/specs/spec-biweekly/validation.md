@@ -33,11 +33,15 @@ python scripts/record_cycle_outcome.py prepare "ATTEMPT_DIR"
 
 Select the archived `.py` file for upload to AlphaNova. Before submitting, compute the SHA-256 of the file you actually selected and confirm it matches the digest printed by `prepare`. In PowerShell, run `Get-FileHash -Algorithm SHA256 "UPLOADED_FILE.py"`. Use the printed handoff directory as `HANDOFF_DIR`. The handoff is stored under `_bmad-output/evidence/submissions/season-2-cycle-1/`. [Official Cycle 1 page](https://www.alphanova.tech/competition/biweekly/season-2/cycle-1)
 
+`prepare` checks that the handoff filesystem supports locking and publication of a complete observation without overwriting an existing file. The check uses same-volume rename on Windows and hard links on POSIX. If the check fails, use a filesystem that supports those operations and rerun `prepare` before uploading.
+
 After uploading, replace `SUBMITTED_SHA256` with the SHA-256 of the uploaded file and enter the verdict reported by AlphaNova (`pending`, `accepted`, or `rejected`).
 
 ```bash
 python scripts/record_cycle_outcome.py record "HANDOFF_DIR" --submitted-sha256 SUBMITTED_SHA256 --verdict pending
 ```
+
+Use the official entry ID for each upload, including repeated uploads of the same file. Once the handoff contains two distinct official entry IDs, add `--official-entry-id "ENTRY_ID"` to every new observation, including the pending command above. In a handoff with fewer than two known IDs, you can omit an unknown ID. The observation stores `null` and stays unassigned.
 
 When AlphaNova reports more facts, run `record` again with the current verdict and any available fields. Use `--official-entry-id` for the AlphaNova entry ID, `--verdict-detail` for the verdict message, `--settled-sharpe=VALUE` for the finite settled score, and `--quality-set-membership yes` or `--quality-set-membership no` for the settled selection result. The equals form also accepts negative scientific notation, such as `--settled-sharpe=-1.23e-3`.
 
@@ -45,7 +49,7 @@ When AlphaNova reports more facts, run `record` again with the current verdict a
 python scripts/record_cycle_outcome.py record "HANDOFF_DIR" --submitted-sha256 SUBMITTED_SHA256 --verdict accepted --official-entry-id "ENTRY_ID" --settled-sharpe=0.0 --quality-set-membership no
 ```
 
-Omit any unknown option. Each successful `record` call writes a new UTC-timestamped JSON file under `HANDOFF_DIR/observations/`. The command runs offline and records the facts you supply.
+Omit optional fields that AlphaNova has yet to report, following the entry-ID requirement above. Each successful `record` call writes a new UTC-timestamped JSON file under `HANDOFF_DIR/observations/`. The command runs offline and records the facts you supply. Once the file is published, `record` exits successfully even if temporary cleanup or output fails. It flushes the saved path to standard output and reports the path on standard error if standard output is unavailable. If both streams are unavailable, check the observation directory for the saved JSON.
 
 ## Quality-set selection
 

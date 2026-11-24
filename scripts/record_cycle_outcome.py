@@ -9,15 +9,28 @@ import re
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from time import sleep
 from uuid import uuid4
 
-if __package__:
-    from .validate_walk_forward import CITY_MAP_PAGE, ROOT, atomic_json, utc_now
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    LOCK_VIOLATION = 33
+    lock_file = ctypes.WinDLL("kernel32", use_last_error=True).LockFile
+    lock_file.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD)
+    lock_file.restype = wintypes.BOOL
 else:
-    from validate_walk_forward import CITY_MAP_PAGE, ROOT, atomic_json, utc_now
+    import fcntl
+
+if __package__:
+    from .validate_walk_forward import CITY_MAP_PAGE, CITY_MIN_DISTANCE, PHASES, ROOT, atomic_json, finite_number, utc_now
+else:
+    from validate_walk_forward import CITY_MAP_PAGE, CITY_MIN_DISTANCE, PHASES, ROOT, atomic_json, finite_number, utc_now
 
 
 SEASON = 2
@@ -30,6 +43,7 @@ DECISION_REPORT = "decision.json"
 HANDOFF_REPORT = "handoff.json"
 OBSERVATIONS = "observations"
 SHA256 = re.compile(r"[0-9a-f]{64}")
+OBSERVATION_FILENAME = re.compile(r"[0-9a-f]{32}\.json")
 
 
 def read_local_file(directory, basename):
@@ -41,9 +55,18 @@ def read_local_file(directory, basename):
     return path.read_bytes()
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def json_object(data, filename):
     try:
-        report = json.loads(data.decode("utf-8"))
+        report = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
     except ValueError as exc:
         raise ValueError(f"Invalid JSON in {filename}: {exc}") from exc
     if not isinstance(report, dict):
@@ -71,6 +94,7 @@ def require_utc_timestamp(report, field, filename):
         timestamp = None
     if timestamp is None or timestamp.utcoffset() != timedelta(0):
         raise ValueError(f"{field} in {filename} must be a valid UTC timestamp")
+    return timestamp
 
 
 def candidate_filename(name):
@@ -84,7 +108,7 @@ def verify_ready_decision(decision, attempt_id, digest):
     if decision.get("status") != "ready" or decision.get("attempt_id") != attempt_id:
         raise ValueError(f"{DECISION_REPORT} must contain a ready decision for attempt {attempt_id}")
     require_integer(decision, "schema_version", SCHEMA_VERSION, DECISION_REPORT)
-    require_utc_timestamp(decision, "decided_at", DECISION_REPORT)
+    decided_at = require_utc_timestamp(decision, "decided_at", DECISION_REPORT)
     if decision.get("reasons") != []:
         raise ValueError(f"The ready decision in {DECISION_REPORT} must have an empty reasons list")
     retained = object_field(decision, "candidate_at_decision", DECISION_REPORT)
@@ -92,6 +116,135 @@ def verify_ready_decision(decision, attempt_id, digest):
         raise ValueError(f"Candidate SHA-256 mismatch in {DECISION_REPORT}")
     if decision.get("cap2_report") != ATTEMPT_REPORT or decision.get("novelty_report") != NOVELTY_REPORT:
         raise ValueError(f"{DECISION_REPORT} must link to {ATTEMPT_REPORT} and {NOVELTY_REPORT}")
+    return decided_at
+
+
+def require_number(report, field, context):
+    value = report.get(field)
+    try:
+        number = finite_number(value)
+    except OverflowError:
+        number = None
+    if number is None:
+        raise ValueError(f"{field} in {context} must be a finite number")
+    return value
+
+
+def require_digest(report, field, context):
+    digest = report.get(field)
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise ValueError(f"Missing or invalid {field} SHA-256 in {context}")
+    return digest
+
+
+def verify_input_digest(report, field, expected, context):
+    entry = object_field(report, field, context)
+    if require_digest(entry, "sha256", f"{context} {field}") != expected:
+        raise ValueError(f"Input SHA-256 mismatch in {context} {field}")
+
+
+def verify_checks(report, failure_field, context):
+    if report.get(failure_field) != []:
+        raise ValueError(f"{context} must have an empty {failure_field} list")
+    checks = report.get("checks")
+    if not isinstance(checks, list):
+        raise ValueError(f"Missing or invalid checks in {context}")
+    for check in checks:
+        if not isinstance(check, dict) or check.get("passed") is not True:
+            name = check.get("name") if isinstance(check, dict) else None
+            raise ValueError(f"Failed or invalid check in {context}: {name}")
+    return checks
+
+
+def verify_phase(phase, inputs, context, candidate_digest=None):
+    if (phase.get("passed") is not True or phase.get("interrupted", False) is not False
+            or phase.get("exit_code", 0) != 0):
+        raise ValueError(f"{context} must contain a passed phase")
+    checks = verify_checks(phase, "failures", context)
+    verify_input_digest(phase, "input_manifest", inputs, context)
+    if candidate_digest is not None:
+        artifact = object_field(phase, "artifact", context)
+        if require_digest(artifact, "sha256", f"{context} artifact") != candidate_digest:
+            raise ValueError(f"Candidate worker artifact SHA-256 mismatch in {context}")
+        for check in checks:
+            if check.get("name") == "worker_artifact":
+                for field in ("expected_sha256", "actual_sha256"):
+                    if field in check and check[field] != candidate_digest:
+                        raise ValueError(f"Candidate worker artifact SHA-256 mismatch in {context} {field}")
+
+
+def verify_ready_metrics(attempt, phases, novelty_phase, decision_metrics):
+    comparison = object_field(attempt, "comparison", ATTEMPT_REPORT)
+    scores = object_field(comparison, "net_sharpe", ATTEMPT_REPORT)
+    candidate = require_number(scores, "candidate", ATTEMPT_REPORT)
+    baseline = require_number(scores, "baseline", ATTEMPT_REPORT)
+    control = require_number(scores, "control", ATTEMPT_REPORT)
+    if not candidate > max(0, baseline):
+        raise ValueError("Candidate Sharpe must be above zero and the baseline")
+    for field in ("candidate_finite", "candidate_positive", "candidate_strictly_above_baseline",
+                  "candidate_performance_passed"):
+        if comparison.get(field) is not True:
+            raise ValueError(f"{field} in {ATTEMPT_REPORT} must be true for a ready candidate")
+
+    for role, score in (("candidate", candidate), ("baseline", baseline), ("control", control)):
+        phase = phases[f"{role}-full"]
+        result = object_field(phase, "runner_result", f"{ATTEMPT_REPORT} {role}-full")
+        if (require_number(result, "net_sharpe", f"{ATTEMPT_REPORT} {role}-full") != score
+                or require_number(decision_metrics, role, DECISION_REPORT) != score):
+            raise ValueError(f"{role} Sharpe mismatch between the comparison, full scores, and decision")
+    novelty_result = object_field(novelty_phase, "runner_result", NOVELTY_REPORT)
+    if require_number(novelty_result, "net_sharpe", NOVELTY_REPORT) != candidate:
+        raise ValueError(f"Candidate Sharpe mismatch in {NOVELTY_REPORT}")
+    if novelty_result != phases["candidate-full"]["runner_result"]:
+        raise ValueError("Candidate runner result mismatch between CAP-2 and novelty")
+    delta_field = "candidate_minus_control"
+    delta = require_number(comparison, delta_field, ATTEMPT_REPORT)
+    if delta != float(candidate) - float(control) or require_number(decision_metrics, delta_field, DECISION_REPORT) != delta:
+        raise ValueError("Candidate-minus-control Sharpe mismatch between the comparison and decision")
+
+
+def verify_ready_novelty(attempt, novelty, decision, candidate_digest):
+    metrics = object_field(decision, "metrics", DECISION_REPORT)
+    phase = object_field(novelty, "phase", NOVELTY_REPORT)
+    phases = object_field(attempt, "phases", ATTEMPT_REPORT)
+    inputs = require_digest(decision, "inputs_sha256", DECISION_REPORT)
+    verify_checks(attempt, "errors", ATTEMPT_REPORT)
+    verify_checks(novelty, "failures", NOVELTY_REPORT)
+    for name in ("metadata", *(name for name, _, _ in PHASES)):
+        worker = object_field(phases, name, ATTEMPT_REPORT)
+        verify_phase(worker, inputs, f"{ATTEMPT_REPORT} {name}",
+                     candidate_digest if name == "candidate-full" else None)
+    verify_phase(phase, inputs, f"{NOVELTY_REPORT} phase", candidate_digest)
+    verify_ready_metrics(attempt, phases, phase, metrics)
+    city = object_field(phase, "novelty", NOVELTY_REPORT)
+    distance = require_number(city, "city_novelty_deg", NOVELTY_REPORT)
+    if not CITY_MIN_DISTANCE <= distance <= 180:
+        raise ValueError(f"Unrounded city distance must be between {CITY_MIN_DISTANCE:g}° and 180°")
+    nearest = city.get("nearest_city")
+    if not isinstance(nearest, str) or not nearest.strip() or nearest.strip().upper() == "N/A":
+        raise ValueError(f"A named nearest_city is required in {NOVELTY_REPORT}")
+    if require_number(metrics, "city_novelty_deg", DECISION_REPORT) != distance or metrics.get("nearest_city") != nearest:
+        raise ValueError("City distance or nearest_city mismatch between the novelty report and decision")
+
+    confirmation = object_field(novelty, "confirmation", NOVELTY_REPORT)
+    if confirmation.get("status") != "confirmed":
+        raise ValueError(f"The scored city map must be confirmed in {NOVELTY_REPORT}")
+    staged_map = object_field(novelty, "map", NOVELTY_REPORT)
+    staged_map_after = object_field(novelty, "staged_map_after", NOVELTY_REPORT)
+    scored_map = require_digest(decision, "scored_map_sha256", DECISION_REPORT)
+    for report, field, context in ((city, "map_sha256", "novelty phase"),
+                                   (staged_map, "sha256", "staged map"),
+                                   (staged_map_after, "sha256", "staged_map_after"),
+                                   (confirmation, "sha256", "map confirmation")):
+        if require_digest(report, field, f"{NOVELTY_REPORT} {context}") != scored_map:
+            raise ValueError(f"Scored map SHA-256 mismatch in {NOVELTY_REPORT} {context}")
+
+    for report, field, filename in ((attempt, "inputs_before", ATTEMPT_REPORT),
+                                     (attempt, "inputs_after", ATTEMPT_REPORT),
+                                     (novelty, "input_manifest", NOVELTY_REPORT),
+                                     (novelty, "inputs_after", NOVELTY_REPORT),
+                                     (novelty, "inputs_at_decision", NOVELTY_REPORT)):
+        verify_input_digest(report, field, inputs, filename)
 
 
 def read_ready_attempt(attempt_dir):
@@ -113,11 +266,11 @@ def read_ready_attempt(attempt_dir):
             or decision_link.get("status") != "ready" or novelty_link.get("path") != NOVELTY_REPORT):
         raise ValueError(f"{ATTEMPT_REPORT} must link to the finalized ready decision and novelty report")
     require_integer(attempt, "schema_version", SCHEMA_VERSION, ATTEMPT_REPORT)
-    require_utc_timestamp(attempt, "finished_at", ATTEMPT_REPORT)
+    cap2_finished = require_utc_timestamp(attempt, "finished_at", ATTEMPT_REPORT)
 
     novelty = json_object(read_local_file(attempt_dir, NOVELTY_REPORT), NOVELTY_REPORT)
     require_integer(novelty, "schema_version", SCHEMA_VERSION, NOVELTY_REPORT)
-    require_utc_timestamp(novelty, "finished_at", NOVELTY_REPORT)
+    novelty_finished = require_utc_timestamp(novelty, "finished_at", NOVELTY_REPORT)
     attempt_id = attempt_dir.name
     if attempt.get("attempt_id") != attempt_id or novelty.get("attempt_id") != attempt_id:
         raise ValueError(f"Attempt ID mismatch across reports for {attempt_id}")
@@ -129,7 +282,9 @@ def read_ready_attempt(attempt_dir):
     digest = candidate.get("sha256")
     if not isinstance(digest, str) or not SHA256.fullmatch(digest):
         raise ValueError(f"Missing or invalid candidate SHA-256 in {ATTEMPT_REPORT}")
-    verify_ready_decision(decision, attempt_id, digest)
+    decided_at = verify_ready_decision(decision, attempt_id, digest)
+    if not cap2_finished <= novelty_finished <= decided_at:
+        raise ValueError("Completion timestamps must be in CAP-2, novelty, and decision order")
     novelty_candidate = object_field(novelty, "candidate", NOVELTY_REPORT)
     if novelty_candidate.get("sha256") != digest:
         raise ValueError(f"Candidate SHA-256 mismatch in {NOVELTY_REPORT}")
@@ -149,6 +304,7 @@ def read_ready_attempt(attempt_dir):
     candidate_bytes = resolved.read_bytes()
     if hashlib.sha256(candidate_bytes).hexdigest() != digest:
         raise ValueError(f"Staged candidate SHA-256 mismatch: {staged_path}")
+    verify_ready_novelty(attempt, novelty, decision, digest)
     return name, digest, candidate_bytes, decision_bytes
 
 
@@ -161,7 +317,9 @@ def verify_handoff(handoff_dir):
         raise ValueError(f"{HANDOFF_REPORT} does not identify this Season {SEASON} Cycle {CYCLE} handoff")
     require_utc_timestamp(handoff, "prepared_at", HANDOFF_REPORT)
     source = handoff.get("source_attempt")
-    if not isinstance(source, str) or not Path(source).is_absolute() or Path(source).name != handoff_dir.name:
+    if (not isinstance(source, str) or "\x00" in source
+            or not any(path.is_absolute() and path.name == handoff_dir.name and ".." not in path.parts
+                       for path in (PurePosixPath(source), PureWindowsPath(source)))):
         raise ValueError(f"source_attempt in {HANDOFF_REPORT} must be an absolute path with the handoff's attempt ID")
 
     name = candidate_filename(handoff.get("candidate_filename"))
@@ -182,13 +340,101 @@ def publish_archive(pending, archive):
     for retry in range(6):
         try:
             pending.rename(archive)
-            return
+            return True
         except OSError as exc:
             if archive.exists() or archive.is_symlink():
-                return  # The caller verifies the archive published by the other writer.
+                return False  # The caller verifies the archive published by the other writer.
             if retry == 5 or getattr(exc, "winerror", None) not in (5, 32, 33):
                 raise
             sleep(0.05 * 2 ** retry)
+
+
+def publish_observation(pending, path):
+    # Windows rename fails if the destination exists. POSIX rename may replace it.
+    if os.name == "nt":
+        os.rename(pending, path)
+    else:
+        os.link(pending, path)
+
+
+def emit_message(message, stream):
+    if stream is None:
+        return False
+    try:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        message = message.encode(encoding, "backslashreplace").decode(encoding)
+        print(message, file=stream, flush=True)
+    except (OSError, ValueError):
+        if stream is sys.__stdout__ or stream is sys.__stderr__:
+            # Prevent Python's exit-time flush from overriding the command's result.
+            try:
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), stream.fileno())
+            except (OSError, ValueError):
+                pass
+        return False
+    return True
+
+
+def report_success(message):
+    if not emit_message(message, sys.stdout):
+        emit_message(message, sys.stderr)
+
+
+def cleanup_temporary(path, *, directory=False):
+    try:
+        if directory:
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        emit_message(f"Temporary cleanup failed for {path}: {exc}", sys.stderr)
+
+
+@contextmanager
+def lock_handoff(directory):
+    stream = (directory / HANDOFF_REPORT).open("rb")
+    try:
+        if os.name == "nt":
+            # Lock beyond EOF so Windows readers can still verify the handoff JSON.
+            offset = stream.seek(1, os.SEEK_END)
+            handle = msvcrt.get_osfhandle(stream.fileno())
+            while not lock_file(handle, offset & 0xffffffff, offset >> 32, 1, 0):
+                error = ctypes.get_last_error()
+                if error != LOCK_VIOLATION:
+                    raise ctypes.WinError(error)
+                sleep(0.05)
+        else:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            stream.close()
+        except OSError as exc:
+            emit_message(f"Handoff lock cleanup failed for {directory}: {exc}", sys.stderr)
+
+
+def check_recording_support(handoff_dir):
+    directory = handoff_dir / OBSERVATIONS
+    try:
+        with lock_handoff(handoff_dir):
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".outcome-probe-", suffix=".tmp",
+                                             delete=False) as temporary:
+                pending = Path(temporary.name)
+            probe = pending.with_suffix(".published")
+            try:
+                publish_observation(pending, probe)
+            except OSError:
+                cleanup_temporary(pending)
+                raise
+            try:
+                pending.unlink(missing_ok=True)
+            finally:
+                probe.unlink()
+    except OSError as exc:
+        raise ValueError(f"Safe observation publication is unavailable at {directory}: {exc}") from exc
 
 
 def prepare(attempt_dir, handoff_root):
@@ -215,17 +461,47 @@ def prepare(attempt_dir, handoff_root):
             (pending / DECISION_REPORT).write_bytes(decision_bytes)
             (pending / OBSERVATIONS).mkdir()
             atomic_json(pending / HANDOFF_REPORT, {**identity, "prepared_at": utc_now()})
-            publish_archive(pending, archive)
+            check_recording_support(pending)
+            if publish_archive(pending, archive):
+                return archive / name, digest
         finally:
-            if pending.exists():
-                shutil.rmtree(pending)
+            cleanup_temporary(pending, directory=True)
 
     if archive.resolve() != archive:
         raise ValueError(f"The existing handoff must be a directory at {archive}")
     existing = verify_handoff(archive)
     if any(existing.get(key) != value for key, value in identity.items()):
         raise ValueError(f"The existing handoff does not match the ready attempt: {archive}")
+    check_recording_support(archive)
     return archive / name, digest
+
+
+def require_entry_id_for_multiple_uploads(directory, handoff):
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "season": SEASON,
+        "cycle": CYCLE,
+        "handoff_id": handoff["attempt_id"],
+        "candidate_sha256": handoff["candidate_sha256"],
+    }
+    known = set()
+    for path in directory.iterdir():
+        if not OBSERVATION_FILENAME.fullmatch(path.name):
+            continue
+        observation = json_object(read_local_file(directory, path.name), path)
+        if any(type(observation.get(field)) is not type(value) or observation.get(field) != value
+               for field, value in identity.items()):
+            continue
+        entry = observation.get("official_entry_id")
+        if entry is None:
+            continue
+        if not isinstance(entry, str):
+            raise ValueError(f"Invalid official_entry_id in {path}")
+        if not entry.strip():
+            continue
+        known.add(entry)
+        if len(known) > 1:
+            raise ValueError("Use --official-entry-id when the handoff has multiple official entry IDs")
 
 
 def record(handoff_dir, args):
@@ -236,7 +512,19 @@ def record(handoff_dir, args):
     digest = args.submitted_sha256.lower()
     if digest != handoff["candidate_sha256"]:
         raise ValueError("Submitted SHA-256 does not match the archived candidate")
+    if args.verdict == "rejected" and args.quality_set_membership == "yes":
+        raise ValueError("A rejected verdict cannot have quality-set membership yes")
+    if args.official_entry_id is not None and not args.official_entry_id.strip():
+        raise ValueError("--official-entry-id must be nonblank when supplied")
 
+    directory = handoff_dir / OBSERVATIONS
+    with lock_handoff(handoff_dir):
+        if args.official_entry_id is None:
+            require_entry_id_for_multiple_uploads(directory, handoff)
+        return save_observation(directory, handoff, digest, args)
+
+
+def save_observation(directory, handoff, digest, args):
     observation = {
         "schema_version": SCHEMA_VERSION,
         "observed_at": utc_now(),
@@ -252,18 +540,16 @@ def record(handoff_dir, args):
         "quality_set_membership": (None if args.quality_set_membership is None
                                    else args.quality_set_membership == "yes"),
     }
-    directory = handoff_dir / OBSERVATIONS
     path = directory / f"{uuid4().hex}.json"
     with tempfile.NamedTemporaryFile(dir=directory, prefix=".outcome-", suffix=".tmp", delete=False) as temporary:
         pending = Path(temporary.name)
     try:
         atomic_json(pending, observation)
-        # Publish the complete file under its final name without replacing an existing observation.
-        os.link(pending, path)
+        publish_observation(pending, path)
     except FileExistsError as exc:
         raise ValueError(f"An observation already exists at {path}") from exc
     finally:
-        pending.unlink(missing_ok=True)
+        cleanup_temporary(pending)
     return path
 
 
@@ -271,6 +557,9 @@ def finite_sharpe(value):
     number = float(value)
     if not math.isfinite(number):
         raise argparse.ArgumentTypeError("settled Sharpe must be finite")
+    mantissa = value.lower().partition("e")[0]
+    if number == 0 and any(digit.isdecimal() and int(digit) != 0 for digit in mantissa):
+        raise argparse.ArgumentTypeError("settled Sharpe underflows to zero")
     return number
 
 
@@ -292,18 +581,18 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             candidate, digest = prepare(args.attempt_dir, HANDOFF_ROOT)
-            print(f"Upload this archived candidate: {candidate}")
-            print(f"Handoff directory: {candidate.parent}")
-            print(f"SHA-256: {digest}")
+            report_success(f"Upload this archived candidate: {candidate}\n"
+                           f"Handoff directory: {candidate.parent}\nSHA-256: {digest}")
         else:
-            print(f"Recorded outcome: {record(args.handoff_dir, args)}")
+            report_success(f"Recorded outcome: {record(args.handoff_dir, args)}")
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"{args.command}: {exc}", file=sys.stderr)
+        emit_message(f"{args.command}: {exc}", sys.stderr)
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            stream.reconfigure(encoding="utf-8")
     raise SystemExit(main())
