@@ -23,6 +23,30 @@ One offline validation command calls the shipped runner, collects the evidence b
 
 [Runner](../../../requirements/runner.py) · [Walk-forward evaluator](../../../requirements/walkforward.py) · [Entry checks](../../../requirements/COMPETITION.md#entry-checks-and-the-overfitting-gate)
 
+## Manual Season 2 Cycle 1 handoff
+
+Run these commands from the repository root. Replace `ATTEMPT_DIR` with the validator's evidence directory for a completed `ready` attempt.
+
+```bash
+python scripts/record_cycle_outcome.py prepare "ATTEMPT_DIR"
+```
+
+Select the archived `.py` file for upload to AlphaNova. Before submitting, compute the SHA-256 of the file you actually selected and confirm it matches the digest printed by `prepare`. In PowerShell, run `Get-FileHash -Algorithm SHA256 "UPLOADED_FILE.py"`. Use the printed handoff directory as `HANDOFF_DIR`. The handoff is stored under `_bmad-output/evidence/submissions/season-2-cycle-1/`. [Official Cycle 1 page](https://www.alphanova.tech/competition/biweekly/season-2/cycle-1)
+
+After uploading, replace `SUBMITTED_SHA256` with the SHA-256 of the uploaded file and enter the verdict reported by AlphaNova (`pending`, `accepted`, or `rejected`).
+
+```bash
+python scripts/record_cycle_outcome.py record "HANDOFF_DIR" --submitted-sha256 SUBMITTED_SHA256 --verdict pending
+```
+
+When AlphaNova reports more facts, run `record` again with the current verdict and any available fields. Use `--official-entry-id` for the AlphaNova entry ID, `--verdict-detail` for the verdict message, `--settled-sharpe=VALUE` for the finite settled score, and `--quality-set-membership yes` or `--quality-set-membership no` for the settled selection result. The equals form also accepts negative scientific notation, such as `--settled-sharpe=-1.23e-3`.
+
+```bash
+python scripts/record_cycle_outcome.py record "HANDOFF_DIR" --submitted-sha256 SUBMITTED_SHA256 --verdict accepted --official-entry-id "ENTRY_ID" --settled-sharpe=0.0 --quality-set-membership no
+```
+
+Omit any unknown option. Each successful `record` call writes a new UTC-timestamped JSON file under `HANDOFF_DIR/observations/`. The command runs offline and records the facts you supply.
+
 ## Quality-set selection
 
 - AlphaNova ranks positive-Sharpe signals. Admission requires the absolute time-averaged cross-sectional correlation to be at most 0.5 against each already selected signal and each signal in the season’s legacy pot. The top three signals in the set earn prizes.
