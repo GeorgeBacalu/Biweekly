@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts import _walk_forward_worker as worker
+from scripts import record_cycle_outcome as outcome
 from scripts import validate_walk_forward as validator
 from scripts._walk_forward_worker import Journal, peak_rss_bytes, position_contract, summarize_result
 from scripts.materialize_control import derive_control
@@ -364,6 +365,14 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(settings, observed.novelty["phase"]["settings"])
         self.assertEqual(settings["sha256"], validator.fingerprint(settings_path)["sha256"])
         self.assertTrue(validator.read_json(settings_path)["gauge_fix"])
+
+        archive_root = self.root / "handoffs"
+        with patch.object(outcome, "HANDOFF_ROOT", archive_root), redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(outcome.main(["prepare", str(observed.attempt)]), 0)
+        staged = observed.attempt / observed.cap2["artifacts"]["candidate"]["staged"]
+        archived = archive_root / observed.attempt.name / staged.name
+        self.assertEqual(archived.read_bytes(), staged.read_bytes())
+        self.assertIn(f"SHA-256: {observed.decision['candidate_sha256']}", stdout.getvalue())
 
     def test_raw_sharpe_and_distance_block_confirmation(self):
         for score, code in ((0.0, "candidate_sharpe_positive"), (-0.1, "candidate_sharpe_positive"),
