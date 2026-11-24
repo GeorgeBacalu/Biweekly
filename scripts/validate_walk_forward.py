@@ -1,4 +1,4 @@
-"""Collect offline CAP-2 evidence with the shipped walk-forward scorer."""
+"""Collect offline walk-forward evidence and a local ready-or-hold decision."""
 
 import argparse
 import hashlib
@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PERIODS = tuple(f"{number:03}" for number in range(1, 32))
 UNIVERSE = "small"
 DATA_DIR = "data/train"
+GAUGE_DIMENSIONS = (19, 20)
+CITY_WORLD = "small-4335-s2"
+CITY_MIN_DISTANCE = 60.0
+CITY_MAP_PAGE = "https://www.alphanova.tech/competition/biweekly/season-2/cycle-1"
+NOVELTY_SETTINGS = "novelty-settings.json"
 TRAIN_LIMIT = 240.0
 PREDICT_LIMIT = 60.0
 STARTUP_ALLOWANCE = 180.0
@@ -86,6 +91,18 @@ def fingerprint(path):
     return {"sha256": digest, "bytes": before.st_size, "mtime_ns": before.st_mtime_ns}
 
 
+def file_evidence(path):
+    try:
+        return fingerprint(path)
+    except (OSError, ValueError) as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def gauge_manifest(kit, expected):
+    paths = [f"{DATA_DIR}/gauge/{period}.{UNIVERSE}.gauge.npy" for period in expected]
+    return {relative: file_evidence(kit / relative) for relative in paths}
+
+
 def input_manifest(root):
     kit = root / "requirements"
     data = kit / DATA_DIR
@@ -98,13 +115,8 @@ def input_manifest(root):
     }
     if data.is_dir():
         data_files.update(path for path in data.iterdir() if SCORE_INPUT.fullmatch(path.name))
-    files = {}
-    for path in sorted(sources | data_files):
-        try:
-            entry = fingerprint(path)
-        except (OSError, ValueError) as exc:
-            entry = {"error": f"{type(exc).__name__}: {exc}"}
-        files[path.relative_to(root).as_posix()] = entry
+    files = {path.relative_to(root).as_posix(): file_evidence(path)
+             for path in sorted(sources | data_files)}
     digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
     return {"sha256": digest, "files": files}
 
@@ -138,14 +150,20 @@ def check(name, passed, **details):
 
 
 def score_value(value):
+    number = finite_number(value)
+    reason = None
+    if number is None:
+        reason = ("non-finite runner Sharpe" if isinstance(value, Real) and not isinstance(value, bool)
+                  else "missing or nonnumeric runner Sharpe")
+    return {"net_sharpe": number, "net_sharpe_reason": reason}
+
+
+def finite_number(value):
     if isinstance(value, Real) and not isinstance(value, bool):
         number = float(value)
         if math.isfinite(number):
-            return {"net_sharpe": number, "net_sharpe_reason": None}
-        reason = "non-finite runner Sharpe"
-    else:
-        reason = "missing or nonnumeric runner Sharpe"
-    return {"net_sharpe": None, "net_sharpe_reason": reason}
+            return number
+    return None
 
 
 def exposure_diagnostic(periods):
@@ -225,14 +243,17 @@ def phase_deadline(mode):
         "metadata": (0, 0),
         "quick": (1, 1),
         "full": (len(PERIODS), len(PERIODS)),
+        "novelty": (len(PERIODS), len(PERIODS)),
         "behavior": (5 * len(REPRESENTATIVE_PERIODS), 20 * len(REPRESENTATIVE_PERIODS)),
     }[mode]
     return STARTUP_ALLOWANCE + train_calls * TRAIN_LIMIT + predict_calls * PREDICT_LIMIT
 
 
-def run_worker(kit, attempt, name, mode, role, artifact, manifest_sha, settings_sha):
+def run_worker(kit, attempt, name, mode, role, artifact, manifest_sha, settings_sha, *, novelty=None):
     phase = attempt / name
     phase.mkdir()
+    if novelty is not None:
+        atomic_json(phase / "novelty-inputs.json", novelty)
     worker = Path(__file__).with_name("_walk_forward_worker.py")
     artifact_path = str(attempt / artifact["staged"]) if artifact else ""
     arguments = [sys.executable, "-u", str(worker), mode, role or "", artifact_path, str(phase)]
@@ -294,14 +315,17 @@ def run_worker(kit, attempt, name, mode, role, artifact, manifest_sha, settings_
         "mode": mode, "artifact": artifact, "exit_code": exit_code, "worker_seconds": worker_seconds,
         "deadline_seconds": deadline, "interrupted": interrupted,
         "input_manifest": {"path": "inputs-before.json", "sha256": manifest_sha},
-        "settings": {"path": "settings.json", "sha256": settings_sha},
+        "settings": {"path": NOVELTY_SETTINGS if mode == "novelty" else "settings.json", "sha256": settings_sha},
         "files": {key: f"{name}/{key}" for key in (
             "stdout.log", "stderr.log", "events.ndjson", "runtime.json", "result.json", "runner.csv",
+            "novelty-inputs.json",
         ) if (phase / key).is_file()},
         "runtime": runtime, "checks": checks, "failures": failures, "calls": calls,
         "peak_rss_bytes": peak, "runner_result": result,
         "worker_process_peak_rss_bytes": final.get("peak_rss_bytes"),
     }
+    if final.get("artifact_snapshot"):
+        record["files"]["artifact_snapshot"] = f"{name}/{final['artifact_snapshot']}"
     if mode == "behavior":
         record["reload_workers"] = [event for event in events if event["event"] == "reload_worker"]
     for key in ("expected_rows", "discovered_periods"):
@@ -311,6 +335,9 @@ def run_worker(kit, attempt, name, mode, role, artifact, manifest_sha, settings_
         periods = {event["period"]: event["rows"] for event in events if event["event"] == "exposure"}
         record["exposure"] = exposure_diagnostic(periods)
         record["observed_scored_rows"] = {period: len(rows) for period, rows in periods.items()}
+    if mode == "novelty":
+        record["novelty"] = next((event["observation"] for event in reversed(events)
+                                  if event["event"] == "novelty_result"), {})
     record["observed_periods"] = {
         event["period"]: event["observation"] for event in events if event["event"] == "scored_period"
     }
@@ -330,7 +357,7 @@ def evaluate_phase(name, record, expected, runtime):
             check("finite_net_sharpe", finite,
                   reason=result.get("net_sharpe_reason", "no runner result")),
         ])
-    if record["mode"] == "full":
+    if record["mode"] in ("full", "novelty"):
         coverage = coverage_checks(result, expected)
         checks.extend(coverage)
         record["comparable"] = (
@@ -362,16 +389,17 @@ def evaluate_phase(name, record, expected, runtime):
 
 def comparison(phases, inputs_stable):
     full = {role: phases.get(f"{role}-full", {}) for role in ARTIFACTS}
-    scores = {role: phase.get("runner_result", {}).get("net_sharpe") for role, phase in full.items()}
+    scores = {role: finite_number(phase.get("runner_result", {}).get("net_sharpe"))
+              for role, phase in full.items()}
     candidate = scores["candidate"]
     finite = candidate is not None
     positive = finite and candidate > 0
     above = None
     delta = None
-    if inputs_stable and full["candidate"].get("comparable"):
-        if full["baseline"].get("comparable"):
+    if inputs_stable and finite and full["candidate"].get("comparable"):
+        if scores["baseline"] is not None and full["baseline"].get("comparable"):
             above = candidate > scores["baseline"]
-        if full["control"].get("comparable"):
+        if scores["control"] is not None and full["control"].get("comparable"):
             delta = candidate - scores["control"]
     return {
         "net_sharpe": scores, "candidate_minus_control": delta,
@@ -381,7 +409,236 @@ def comparison(phases, inputs_stable):
     }
 
 
-def collect(root=ROOT, evidence_dir=None):
+def stage_city_map(attempt, source):
+    record = {"source": None, "staged": None, "verified_at": None}
+    if source is None:
+        return {**record, "error": "No city map supplied via --city-map"}
+    source = Path(source).absolute()
+    staged = attempt / "city-map.parquet"
+    record["source"] = str(source)
+    try:
+        contents = source.read_bytes()
+        staged.write_bytes(contents)
+    except OSError as exc:
+        return {**record, "error": f"{type(exc).__name__}: {exc}"}
+    record.update(staged=staged.name, staged_at=utc_now(), bytes=len(contents),
+                  sha256=hashlib.sha256(contents).hexdigest())
+    return record
+
+
+def confirm_city_map(scored_sha, staged_map):
+    confirmation = {"status": "declined", "source": CITY_MAP_PAGE, "attested_at": None,
+                    "verified_at": None}
+    try:
+        print(f"Re-download the latest official Season 2 Cycle 1 city map from {CITY_MAP_PAGE} and extract it.",
+              flush=True)
+        answer = input("Have you just downloaded the latest map from that page? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            return confirmation
+        confirmation["attested_at"] = utc_now()
+        path = input("Path to the newly extracted Parquet (blank to decline): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return confirmation
+    except (OSError, UnicodeError) as exc:
+        return {**confirmation, "status": "prompt_error", "error": f"{type(exc).__name__}: {exc}"}
+    if not path:
+        return confirmation
+    try:
+        file = Path(path).absolute()
+        confirmation["local_path"] = str(file)
+        if file.samefile(staged_map):
+            return {**confirmation, "status": "staged_map"}
+        verified = file_evidence(file)
+    except KeyboardInterrupt:
+        return confirmation
+    except (OSError, ValueError) as exc:
+        return {**confirmation, "status": "unreadable", "error": f"{type(exc).__name__}: {exc}"}
+    if "error" in verified:
+        return {**confirmation, "status": "unreadable", "error": verified["error"]}
+    sha = verified["sha256"]
+    return {**confirmation, "sha256": sha, "verified_at": utc_now(),
+            "status": "confirmed" if sha == scored_sha else "map_changed"}
+
+
+def collect_novelty(root, attempt, report, before, city_map):
+    candidate = report.get("artifacts", {}).get("candidate", {})
+    metadata = report["phases"].get("metadata", {})
+    expected = metadata.get("expected_rows", {})
+    novelty = {
+        "schema_version": 1, "attempt_id": attempt.name, "cap2_report": "attempt.json",
+        "candidate": candidate, "input_manifest": report.get("inputs_before"),
+        "cap2_settings": report.get("settings"), "gauge_fix": True, "started_at": utc_now(),
+        "expected_coverage": {"per_period": expected, "total": sum(expected.values())},
+        "checks": [], "failures": [], "phase": {},
+    }
+    checks = novelty["checks"]
+    try:
+        staged = novelty["map"] = stage_city_map(attempt, city_map)
+        checks.append(check("map_staged", "sha256" in staged, error=staged.get("error")))
+        inputs_stable = any(item["name"] == "input_drift" and item["passed"] for item in report["checks"])
+        interrupted = (any(record.get("interrupted") for record in report["phases"].values())
+                       or any(error.get("interrupted") for error in report["errors"]))
+        eligible = inputs_stable and not interrupted and metadata.get("passed") and "sha256" in candidate
+        checks.append(check("novelty_inputs", eligible, inputs_stable=inputs_stable,
+                            cap2_interrupted=interrupted, metadata_passed=bool(metadata.get("passed"))))
+        if "sha256" not in staged or not eligible:
+            return novelty
+
+        kit = root / "requirements"
+        settings_path = attempt / NOVELTY_SETTINGS
+        atomic_json(settings_path, {**read_json(attempt / report["settings"]["path"]), "gauge_fix": True})
+        settings_sha = fingerprint(settings_path)["sha256"]
+        novelty["settings"] = {"path": settings_path.name, "sha256": settings_sha}
+        novelty["gauges_before"] = gauge_manifest(kit, expected)
+        print("Running candidate-novelty", flush=True)
+        try:
+            record = novelty["phase"] = run_worker(
+                kit, attempt, "candidate-novelty", "novelty", "candidate", candidate,
+                report["inputs_before"]["sha256"], settings_sha,
+                novelty={"expected_rows": expected, "map_path": str(attempt / staged["staged"]),
+                         "map_sha256": staged["sha256"],
+                         "gauge_sha256": {path: entry.get("sha256")
+                                          for path, entry in novelty["gauges_before"].items()}},
+            )
+            evaluate_phase("candidate-novelty", record, expected, metadata["runtime"])
+            checks.append(check("novelty_worker", record["passed"]))
+            full = report["phases"].get("candidate-full", {}).get("runner_result")
+            checks.append(check("candidate_score_agreement", bool(full) and record["runner_result"] == full))
+        finally:
+            novelty["gauges_after"] = gauge_manifest(kit, expected)
+            changed = [path for path, entry in novelty["gauges_before"].items()
+                       if novelty["gauges_after"].get(path) != entry]
+            missing = [path for path, entry in novelty["gauges_before"].items() if "error" in entry]
+            checks.append(check("gauge_digests", not changed and not missing, changed=changed, unavailable=missing))
+            map_after = novelty["staged_map_after"] = file_evidence(attempt / staged["staged"])
+            checks.append(check("staged_map_drift", map_after.get("sha256") == staged["sha256"]))
+            after = input_manifest(root)
+            atomic_json(attempt / "inputs-after-novelty.json", after)
+            novelty["inputs_after"] = {"path": "inputs-after-novelty.json", "sha256": after["sha256"]}
+            changes = changed_inputs(before, after)
+            checks.append(check("novelty_input_drift", not changes, changed=changes))
+    except (Exception, KeyboardInterrupt) as exc:
+        novelty["failures"].append(f"{type(exc).__name__}: {exc}")
+    return novelty
+
+
+NOVELTY_CHECK_REASONS = {
+    "map_staged": "A supplied city map could not be staged.",
+    "novelty_inputs": "CAP-2 did not provide stable scoring inputs and metadata for novelty.",
+    "novelty_worker": "The novelty worker failed validation. See its checks and failures.",
+    "candidate_score_agreement": "The novelty Sharpe or its coverage differs from the candidate's CAP-2 full result.",
+    "gauge_digests": "Expected raw gauge files were unavailable or changed during novelty scoring.",
+    "staged_map_drift": "The staged map changed during novelty scoring.",
+    "novelty_input_drift": "CAP-2 scoring inputs changed during novelty scoring.",
+}
+
+
+def decision_prerequisites(attempt, report, novelty):
+    comparison = report["comparison"]
+    metrics = dict(comparison["net_sharpe"])
+    candidate = novelty["candidate"]
+    observation = novelty["phase"].get("novelty", {})
+    distance = finite_number(observation.get("city_novelty_deg"))
+    nearest = observation.get("nearest_city")
+    scored_map = observation.get("map_sha256")
+    retained = file_evidence(attempt / candidate["staged"]) if candidate.get("staged") else {}
+    metrics.update(candidate_minus_control=comparison["candidate_minus_control"],
+                   city_novelty_deg=distance, nearest_city=nearest)
+    gates = [
+        ("cap2_failed", report["status"] == "passed", "CAP-2 checks failed. See attempt.json."),
+        ("candidate_digest", bool(candidate.get("sha256")) and retained.get("sha256") == candidate["sha256"],
+         "The staged candidate is unavailable or its digest differs from the scored candidate."),
+        ("candidate_sharpe_finite", comparison["candidate_finite"], "The candidate Sharpe is not finite."),
+        ("candidate_sharpe_positive", not comparison["candidate_finite"] or comparison["candidate_positive"],
+         "The candidate Sharpe must be greater than zero."),
+        ("candidate_beats_baseline", comparison["candidate_strictly_above_baseline"] is True,
+         "The candidate did not show a strictly higher Sharpe than the shipped baseline."),
+        ("novelty_failure", not novelty["failures"], "Novelty collection raised an error. See novelty.json."),
+        ("scored_map_digest", bool(scored_map) and scored_map == novelty.get("map", {}).get("sha256"),
+         "No city comparison is linked to the staged map digest."),
+        ("city_distance_available", distance is not None and 0 <= distance <= 180,
+         "A finite nearest-city distance in [0°, 180°] is unavailable."),
+        ("nearest_city_available", bool(nearest) and nearest != "N/A", "The nearest city is unavailable."),
+        ("city_distance_threshold", distance is None or distance >= CITY_MIN_DISTANCE,
+         "The raw nearest-city distance is below 60°."),
+    ]
+    gates.extend((item["name"], item["passed"], item.get("error") or NOVELTY_CHECK_REASONS[item["name"]])
+                 for item in novelty["checks"])
+    reasons = [{"code": code, "message": message} for code, passed, message in gates if not passed]
+    for reason in reasons:
+        if reason["code"] == "novelty_worker":
+            phase = novelty["phase"]
+            reason["failed_checks"] = [
+                {key: item[key] for key in ("name", "period", "error") if key in item and item[key] is not None}
+                for item in phase["checks"] if not item["passed"]
+            ]
+            reason["failures"] = phase["failures"]
+    return metrics, retained, reasons
+
+
+def record_decision(root, attempt, report, novelty, before, request_confirmation):
+    metrics, retained, reasons = decision_prerequisites(attempt, report, novelty)
+    observation = novelty["phase"].get("novelty", {})
+    scored_sha = observation.get("map_sha256")
+    confirmation = {"status": "not_requested", "verified_at": None}
+    if request_confirmation:
+        if reasons:
+            confirmation["status"] = "prerequisites_failed"
+        else:
+            staged_map = attempt / novelty["map"]["staged"]
+            confirmation = confirm_city_map(scored_sha, staged_map)
+            drift_reasons = []
+            try:
+                after = input_manifest(root)
+                atomic_json(attempt / "inputs-at-decision.json", after)
+                novelty["inputs_at_decision"] = {"path": "inputs-at-decision.json", "sha256": after["sha256"]}
+                changed = changed_inputs(before, after)
+                if changed:
+                    drift_reasons.append({"code": "decision_input_drift", "changed": changed,
+                                          "message": "Scoring inputs changed before the decision."})
+                staged_digest = file_evidence(staged_map).get("sha256")
+                if staged_digest != scored_sha:
+                    drift_reasons.append({"code": "decision_map_drift",
+                                          "message": "The staged map changed before the decision."})
+                gauges = gauge_manifest(root / "requirements", novelty["expected_coverage"]["per_period"])
+                if gauges != novelty["gauges_after"]:
+                    drift_reasons.append({"code": "decision_gauge_drift",
+                                          "message": "Gauge files changed before the decision."})
+            except (Exception, KeyboardInterrupt) as exc:
+                drift_reasons.append({"code": "decision_provenance_unavailable", "error": str(exc),
+                                      "message": "Scoring input digests could not be checked before the decision."})
+            _, retained, reasons = decision_prerequisites(attempt, report, novelty)
+            reasons.extend(drift_reasons)
+    if confirmation["status"] != "confirmed" or confirmation.get("sha256") != scored_sha:
+        messages = {
+            "map_changed": "The latest official map differs from the scored map. Run novelty again for this candidate.",
+            "unreadable": "The confirmed download could not be read.",
+            "staged_map": "Supply the newly extracted official download in a separate file from the attempt snapshot.",
+            "prompt_error": "The current-map confirmation prompt could not be completed.",
+        }
+        reason = {"code": "current_map_confirmation",
+                  "message": messages.get(confirmation["status"], "The scored city map lacks current official confirmation.")}
+        if "error" in confirmation:
+            reason["error"] = confirmation["error"]
+        reasons.append(reason)
+    novelty["confirmation"] = confirmation
+    if confirmation["status"] == "confirmed":
+        novelty["map"]["verified_at"] = confirmation["verified_at"]
+        novelty["map"]["verified_source"] = confirmation["source"]
+    novelty["finished_at"] = utc_now()
+    decision = {
+        "schema_version": 1, "attempt_id": attempt.name, "decided_at": utc_now(),
+        "status": "hold" if reasons else "ready", "reasons": reasons, "metrics": metrics,
+        "candidate_sha256": novelty["candidate"].get("sha256"), "candidate_at_decision": retained,
+        "scored_map_sha256": scored_sha, "inputs_sha256": report.get("inputs_before", {}).get("sha256"),
+        "cap2_report": "attempt.json", "novelty_report": "novelty.json",
+    }
+    atomic_json(attempt / "novelty.json", novelty)
+    atomic_json(attempt / "decision.json", decision)
+    return decision
+
+
+def collect(root=ROOT, evidence_dir=None, *, city_map=None, confirm_current_map=False):
     evidence_dir = evidence_dir or root / "_bmad-output" / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -454,7 +711,8 @@ def collect(root=ROOT, evidence_dir=None):
                     if record.get("interrupted"):
                         break
     except (Exception, KeyboardInterrupt) as exc:
-        report["errors"].append({"phase": "collection", "error": f"{type(exc).__name__}: {exc}"})
+        report["errors"].append({"phase": "collection", "error": f"{type(exc).__name__}: {exc}",
+                                 "interrupted": isinstance(exc, KeyboardInterrupt)})
     finally:
         stable = False
         if before is not None:
@@ -465,8 +723,10 @@ def collect(root=ROOT, evidence_dir=None):
                 changed = changed_inputs(before, after)
                 checks.append(check("input_drift", not changed, changed=changed))
                 stable = not changed
-            except (OSError, ValueError) as exc:
-                checks.append(check("input_drift", False, error=str(exc)))
+            except (OSError, ValueError, KeyboardInterrupt) as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    report["errors"].append({"phase": "input_drift", "error": "KeyboardInterrupt", "interrupted": True})
+                checks.append(check("input_drift", False, error=f"{type(exc).__name__}: {exc}"))
         for name, artifact in artifacts.items():
             if "sha256" not in artifact:
                 continue
@@ -477,8 +737,10 @@ def collect(root=ROOT, evidence_dir=None):
                 checks.append(check("artifact_drift", matches, artifact=name,
                                     source_sha256=source, staged_sha256=retained))
                 stable = stable and matches
-            except (OSError, ValueError) as exc:
-                checks.append(check("artifact_drift", False, artifact=name, error=str(exc)))
+            except (OSError, ValueError, KeyboardInterrupt) as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    report["errors"].append({"phase": "artifact_drift", "error": "KeyboardInterrupt", "interrupted": True})
+                checks.append(check("artifact_drift", False, artifact=name, error=f"{type(exc).__name__}: {exc}"))
                 stable = False
         report["comparison"] = comparison(phases, stable)
         checks.append(check("all_phases_ran", {"metadata", *(name for name, _, _ in PHASES)} == phases.keys(),
@@ -487,15 +749,24 @@ def collect(root=ROOT, evidence_dir=None):
                   and all(record.get("passed") for record in phases.values()))
         report.update(status="passed" if passed else "failed", finished_at=utc_now())
         atomic_json(attempt / "attempt.json", report)
+    novelty = collect_novelty(root, attempt, report, before, city_map)
+    decision = record_decision(root, attempt, report, novelty, before, confirm_current_map)
+    report.update(novelty={"path": "novelty.json"},
+                  decision={"path": "decision.json", "status": decision["status"]})
+    atomic_json(attempt / "attempt.json", report)
     return attempt, report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
-    attempt, report = collect()
+    parser.add_argument("--city-map", type=Path, help="Extracted Season 2 city map Parquet for novelty scoring")
+    parser.add_argument("--confirm-current-map", action="store_true",
+                        help="Offer to confirm a fresh official map download when the candidate meets the other prerequisites")
+    args = parser.parse_args()
+    attempt, report = collect(city_map=args.city_map, confirm_current_map=args.confirm_current_map)
     print(f"Evidence collection {report['status']}: {attempt / 'attempt.json'}")
     print(json.dumps(report["comparison"], allow_nan=False))
+    print(f"Decision {report['decision']['status']}: {attempt / 'decision.json'}")
     return 0 if report["status"] == "passed" else 1
 
 
